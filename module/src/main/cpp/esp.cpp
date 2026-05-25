@@ -99,88 +99,6 @@ static void *get_singleton_instance(Il2CppClass *klass) {
     return inst;
 }
 
-// One-time HeroActors inspection: dump class name + first 0x80 bytes hex of hero[0]
-// Returns immediately on second call (idempotent flag).
-static void inspect_hero_actors_once(void *am) {
-    static bool done = false;
-    if (done) return;
-    static Il2CppClass *am_klass = nullptr;
-    if (!am_klass) am_klass = il2cpp_object_get_class((Il2CppObject *)am);
-    if (!am_klass) return;
-
-    FieldInfo *f_hero = il2cpp_class_get_field_from_name(am_klass, "HeroActors");
-    if (!f_hero) { LOGE("[v19] no HeroActors field"); done = true; return; }
-    int off_hero = il2cpp_field_get_offset(f_hero);
-    LOGI("[v19] HeroActors raw offset=0x%x", off_hero);
-
-    void *tvl = *(void **)((char *)am + off_hero);
-    if (!tvl) { LOGI("[v19] HeroActors tvl=null (not yet inited)"); return; }
-    LOGI("[v19] HeroActors tvl=%p", tvl);
-
-    Il2CppClass *tvl_klass = il2cpp_object_get_class((Il2CppObject *)tvl);
-    if (!tvl_klass) { LOGE("[v19] no tvl class"); return; }
-    const char *tvl_name = il2cpp_class_get_name(tvl_klass);
-    LOGI("[v19] tvl class=%s", tvl_name ? tvl_name : "?");
-
-    // Walk fields of TinyValueList to find Item_Backends + Size
-    FieldInfo *f_items = il2cpp_class_get_field_from_name(tvl_klass, "Item_Backends");
-    FieldInfo *f_size  = il2cpp_class_get_field_from_name(tvl_klass, "Size");
-    if (!f_items || !f_size) {
-        // try parent
-        Il2CppClass *parent = il2cpp_class_get_parent(tvl_klass);
-        if (parent) {
-            if (!f_items) f_items = il2cpp_class_get_field_from_name(parent, "Item_Backends");
-            if (!f_size)  f_size  = il2cpp_class_get_field_from_name(parent, "Size");
-        }
-    }
-    if (!f_items || !f_size) { LOGE("[v19] tvl fields missing"); done = true; return; }
-    int off_items = il2cpp_field_get_offset(f_items);
-    int off_size  = il2cpp_field_get_offset(f_size);
-    LOGI("[v19] Item_Backends=0x%x  Size=0x%x", off_items, off_size);
-
-    int sz = *(int *)((char *)tvl + off_size);
-    void *arr = *(void **)((char *)tvl + off_items);
-    LOGI("[v19] Size=%d Item_Backends=%p", sz, arr);
-    if (!arr || sz <= 0) return;
-
-    // arr is managed PoolObjHandle<T>[] - try common element start offsets
-    // IL2CPP arm64 typical: header 0x20, element stride from class info.
-    // PoolObjHandle = 16 bytes (seq+pad+T*). Read first element's T* at +8.
-    // Try array+0x20 first (most common).
-    char *first_elem = (char *)arr + 0x20;
-    uint32_t seq = *(uint32_t *)(first_elem + 0);
-    void *first_obj = *(void **)(first_elem + 8);
-    LOGI("[v19] elem[0]: seq=%u obj=%p", seq, first_obj);
-    if (!first_obj) { done = true; return; }
-
-    // Get class name of T (the hero object)
-    Il2CppClass *hero_klass = il2cpp_object_get_class((Il2CppObject *)first_obj);
-    if (hero_klass) {
-        const char *hn = il2cpp_class_get_name(hero_klass);
-        const char *ns = il2cpp_class_get_namespace(hero_klass);
-        LOGI("[v19] hero[0] class=%s.%s", ns?ns:"", hn?hn:"?");
-    }
-
-    // Hex dump first 0x80 bytes of hero[0] object (8-byte aligned reads)
-    char buf[600];
-    int pos = 0;
-    for (int row = 0; row < 16; ++row) {
-        int n = snprintf(buf + pos, sizeof(buf) - pos, "+%03x: ", row * 16);
-        if (n < 0 || n >= (int)(sizeof(buf) - pos)) break;
-        pos += n;
-        for (int col = 0; col < 2; ++col) {
-            uint64_t v = *(uint64_t *)((char *)first_obj + row * 16 + col * 8);
-            n = snprintf(buf + pos, sizeof(buf) - pos, "%016llx ", (unsigned long long)v);
-            if (n < 0 || n >= (int)(sizeof(buf) - pos)) goto out;
-            pos += n;
-        }
-        LOGI("[v19] %s", buf);
-        pos = 0;
-    }
-out:
-    done = true;
-}
-
 // Scan ActorManager.updatableActorList 鈫?populate output vector
 // Returns count of actors collected (0 if AM not ready).
 static int scan_actors(std::vector<EspActor> &out) {
@@ -203,8 +121,6 @@ static int scan_actors(std::vector<EspActor> &out) {
     void *am = nullptr;
     il2cpp_field_static_get_value(cached_s_inst, &am);
     if (!am) return 0;
-
-    inspect_hero_actors_once(am);
 
     void *dictview = *(void **)((char *)am + AM_UPDATABLE_LIST);
     if (!dictview) return 0;
