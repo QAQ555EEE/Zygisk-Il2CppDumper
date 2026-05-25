@@ -1,14 +1,38 @@
 //
-// ESP loop v11: periodic actor scan + abstract Unix socket server
-// Streams binary EspActor[] packets to any client connected to @sgame_esp
+// ESP loop v23: hero-only scan via GamePlayerCenter.
+// Streams binary EspActor[] packets to overlay via TCP 127.0.0.1:47291.
 //
 // Protocol (host-endian little, all sgame is aarch64):
-//   Each packet:
-//     magic[4]    "ESP1"
-//     count       uint32  (number of EspActor entries)
-//     actors[]    EspActor (52 bytes each)
+//   header  : magic[4]="ESP1"  count(u32)
+//   actors  : EspActor[count]  (48 bytes each, packed)
 //
-// Period: 500 ms (low enough to be smooth, high enough to avoid timing detect)
+// EspActor (kept binary-compatible with overlay-app v13's ACTOR_BYTES=48):
+//   key(u32)  type(i32)  configId(i32)  camp(i32)
+//   battleOrder(i32) objId(u32) x(f32) y(f32) z(f32)
+//   fwdX(i32) fwdY(i32) fwdZ(i32)
+//
+// type=0 (ActorTypeDef.HERO) is the only value we emit.  Overlay filters on
+// (type==0 && camp==2) to draw enemy red dots.
+//
+// Data path (verified against dump.cs ground truth, Scripts.GameSystem):
+//   GamePlayerCenter.s_instance
+//     +0x18 m_playerLinkerList = DictionaryView<UInt32, Player>
+//     +0x40 hostPlayerID       = u32 (my player id)
+//   Player:
+//     +0x008 playerCamp         (COM_PLAYERCAMP, i32) -- 1 or 2 in 5v5
+//     +0x180 captainConfigID    (u32 hero id)
+//     +0x198 Captain            (PoolObjHandle<ActorConfig>, T* at +0x8)
+//   ActorConfig:
+//     +0x050 inner              (ActorConfigInner*)
+//   ActorConfigInner:
+//     +0x008 actorLinker        (ActorLinker*)
+//   ActorLinker:
+//     +0x4AC ObjID              (u32)
+//     +0x4B8 forward            (VInt3 = 3*i32, scaled *1000)
+//     +0x4C4 position           (Vector3 = 3*f32, world units)
+//
+// Why not Player.captainLogicPos@0x408 directly? It's never written outside
+// recovery snapshots -- not real-time. Live position lives on ActorLinker.
 //
 
 #include "esp.h"
@@ -17,54 +41,57 @@
 #include "il2cpp-class.h"
 #include <thread>
 #include <atomic>
-#include <mutex>
 #include <vector>
 #include <unistd.h>
 #include <cstring>
 #include <cstdio>
 #include <sys/socket.h>
-#include <sys/un.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
-#include <fcntl.h>
-#include <poll.h>
 #include <errno.h>
 
 #define DO_API(r, n, p) extern r (*n) p
 #include "il2cpp-api-functions.h"
 #undef DO_API
 
-// ===== layout offsets (verified by v10) =====
-#define AM_UPDATABLE_LIST   0x10  // Dict<uint, ActorConfig*> - organ/monster/soldier only
-#define AM_HERO_ACTORS      0x18  // TinyValueList<PoolObjHandle<ActorConfig>> - heroes
-#define AC_ACTORTYPE        0x18
-#define AC_CONFIGID         0x1c
-#define AC_CMPTYPE          0x20
-#define AC_BATTLEORDER      0x24
-#define AC_INNER            0x50
-#define INNER_LINKER        0x8
+// ===== layout offsets (dump.cs ground truth) =====
+#define GPC_PLAYER_LIST     0x18
+#define GPC_HOST_PLAYER_ID  0x40
+
+#define PLAYER_CAMP         0x008
+#define PLAYER_CFG_ID       0x180
+#define PLAYER_CAPTAIN      0x198  // PoolObjHandle<ActorConfig>: 16 bytes
+#define POOLHANDLE_T_PTR    0x008  // ActorConfig* at handle+8
+
+#define AC_INNER            0x050
+#define INNER_LINKER        0x008
 #define AL_OBJID            0x4AC
 #define AL_FORWARD          0x4B8
 #define AL_POSITION         0x4C4
 
-// TinyValueList (AbstractBaseTinyList<T>) managed obj layout:
-//   +0x00 klass*  +0x08 monitor  +0x10 Item_Backends (T[])  +0x18 Size (int32)
-// Il2CppArray on aarch64: 0x20 header, elements at +0x20
-// PoolObjHandle<ActorConfig>: 16 bytes (seq uint32 + 4 pad + ActorConfig* at +8)
-#define TVL_ITEMS           0x10
-#define TVL_SIZE            0x18
-#define ARRAY_ELEMENTS      0x20
-#define POOLHANDLE_STRIDE   16
-#define POOLHANDLE_T_PTR    8
+// IL2CPP Dictionary<TKey,TValue> on this sgame build (mscorlib, no +0x50 prefix):
+//   +0x10  _entries (T[])    -- entries array, elements start at array+0x18
+//   +0x18  _count            -- live entry count
+// Entry layout (stride 24):  hashCode(i32) next(i32) key(u32) pad(i32) value(ptr)
+// Free entries have hashCode<0 && next<0.
+#define DICT_ENTRIES        0x10
+#define DICT_COUNT          0x18
+#define ENTRIES_BASE        0x18
+#define ENTRY_STRIDE        24
+#define ENTRY_KEY           8
+#define ENTRY_VALUE         16
 
-// Pointer plausibility: must be in mmap range (above 0x10000) and 8-byte aligned.
-// This catches the 0x1f / 0x57 garbage values that crashed v17/v19.
+// DictionaryView<,>.Context: reflected at +0x8, runtime +0x18 after the IL2CPP
+// managed-object header (0x10). We reflect at startup to absorb any future
+// layout drift between IL2CPP runtime versions.
+
+#define SOCK_PORT 47291
+
 static inline bool is_plausible_ptr(const void *p) {
     uintptr_t v = (uintptr_t)p;
     return v >= 0x10000 && (v & 7) == 0;
 }
 
-// ===== protocol =====
 #pragma pack(push, 1)
 struct EspActor {
     uint32_t key;
@@ -81,14 +108,8 @@ struct EspHeader {
     uint32_t count;
 };
 #pragma pack(pop)
+static_assert(sizeof(EspActor) == 48, "EspActor must be 48 bytes for overlay v13");
 
-// SELinux blocks untrusted_app -> untrusted_app abstract unix sockets,
-// so we use TCP loopback instead.
-#define SOCK_PORT 47291
-
-// ===== shared state =====
-static std::mutex g_actors_mtx;
-static std::vector<EspActor> g_actors;
 static std::atomic<int> g_client_fd{-1};
 
 static Il2CppClass *find_class_anywhere(const char *ns, const char *name) {
@@ -104,184 +125,96 @@ static Il2CppClass *find_class_anywhere(const char *ns, const char *name) {
     return nullptr;
 }
 
-static void *get_singleton_instance(Il2CppClass *klass) {
-    if (!klass) return nullptr;
-    Il2CppClass *parent = il2cpp_class_get_parent(klass);
-    FieldInfo *f = il2cpp_class_get_field_from_name(parent, "s_instance");
-    if (!f) f = il2cpp_class_get_field_from_name(klass, "s_instance");
-    if (!f) return nullptr;
-    void *inst = nullptr;
-    il2cpp_field_static_get_value(f, &inst);
-    return inst;
+// Walk one Player into ActorLinker, emit one EspActor if everything resolves.
+static bool emit_player(void *player, uint32_t key, std::vector<EspActor> &out) {
+    if (!is_plausible_ptr(player)) return false;
+
+    int32_t camp     = *(int32_t  *)((char *)player + PLAYER_CAMP);
+    uint32_t cfgId   = *(uint32_t *)((char *)player + PLAYER_CFG_ID);
+
+    // Captain is a 16-byte PoolObjHandle struct embedded in Player; T* is at +8.
+    void *ac = *(void **)((char *)player + PLAYER_CAPTAIN + POOLHANDLE_T_PTR);
+    if (!is_plausible_ptr(ac)) return false;
+
+    void *inner = *(void **)((char *)ac + AC_INNER);
+    if (!is_plausible_ptr(inner)) return false;
+
+    void *al = *(void **)((char *)inner + INNER_LINKER);
+    if (!is_plausible_ptr(al)) return false;
+
+    EspActor a{};
+    a.key         = key;
+    a.type        = 0;             // ActorTypeDef.HERO
+    a.configId    = (int32_t)cfgId;
+    a.camp        = camp;
+    a.battleOrder = 0;
+    a.objId       = *(uint32_t *)((char *)al + AL_OBJID);
+    float *p      = (float *)((char *)al + AL_POSITION);
+    a.x = p[0]; a.y = p[1]; a.z = p[2];
+    int32_t *f    = (int32_t *)((char *)al + AL_FORWARD);
+    a.fwd_x = f[0]; a.fwd_y = f[1]; a.fwd_z = f[2];
+    out.push_back(a);
+    return true;
 }
 
-// Scan ActorManager.updatableActorList 鈫?populate output vector
-// Returns count of actors collected (0 if AM not ready).
-static int scan_actors(std::vector<EspActor> &out) {
+// Returns number of heroes emitted (0 if GPC not ready / match not started).
+static int scan_heroes(std::vector<EspActor> &out) {
     out.clear();
 
-    static Il2CppClass *cached_am_klass = nullptr;
+    static Il2CppClass *cached_klass = nullptr;
     static FieldInfo *cached_s_inst = nullptr;
-    static Il2CppClass *cached_dv_klass = nullptr;
-    static int cached_off_ctx = -1;
+    static int       cached_dv_ctx  = -1;
+    static bool init_failed = false;
+    if (init_failed) return 0;
 
-    if (!cached_am_klass) {
-        cached_am_klass = find_class_anywhere("Assets.Scripts.GameLogic", "ActorManager");
-        if (!cached_am_klass) return 0;
-        Il2CppClass *parent = il2cpp_class_get_parent(cached_am_klass);
+    if (!cached_klass) {
+        cached_klass = find_class_anywhere("Assets.Scripts.GameSystem", "GamePlayerCenter");
+        if (!cached_klass) { init_failed = true; return 0; }
+        Il2CppClass *parent = il2cpp_class_get_parent(cached_klass);
         cached_s_inst = il2cpp_class_get_field_from_name(parent, "s_instance");
-        if (!cached_s_inst) cached_s_inst = il2cpp_class_get_field_from_name(cached_am_klass, "s_instance");
-        if (!cached_s_inst) return 0;
-    }
-
-    void *am = nullptr;
-    il2cpp_field_static_get_value(cached_s_inst, &am);
-    if (!am) return 0;
-
-    void *dictview = *(void **)((char *)am + AM_UPDATABLE_LIST);
-    if (!dictview) return 0;
-
-    if (!cached_dv_klass) {
-        cached_dv_klass = il2cpp_object_get_class((Il2CppObject *)dictview);
-        FieldInfo *f_ctx = il2cpp_class_get_field_from_name(cached_dv_klass, "Context");
-        int raw = f_ctx ? il2cpp_field_get_offset(f_ctx) : 0;
-        cached_off_ctx = raw >= 0x10 ? raw : (raw + 0x10);
-    }
-
-    void *dict = *(void **)((char *)dictview + cached_off_ctx);
-    if (!dict) return 0;
-
-    int count = *(int *)((char *)dict + 0x18);
-    void *entries = *(void **)((char *)dict + 0x10);
-    if (!entries || count <= 0 || count > 256) return 0;
-
-    out.reserve(count);
-    for (int i = 0; i < count + 8 && (int)out.size() < count; i++) {
-        if (i >= 256) break;  // safety
-        char *e = (char *)entries + 0x18 + i * 24;
-        int hashCode = *(int *)(e + 0);
-        int next     = *(int *)(e + 4);
-        uint32_t key = *(uint32_t *)(e + 8);
-        void *ac     = *(void **)(e + 16);
-        if (hashCode < 0 && next < 0) continue;
-        if (!ac) continue;
-
-        void *inner = *(void **)((char *)ac + AC_INNER);
-        if (!inner) continue;
-        void *al = *(void **)((char *)inner + INNER_LINKER);
-        if (!al) continue;
-
-        EspActor a;
-        a.key         = key;
-        a.type        = *(int *)((char *)ac + AC_ACTORTYPE);
-        a.configId    = *(int *)((char *)ac + AC_CONFIGID);
-        a.camp        = *(int *)((char *)ac + AC_CMPTYPE);
-        a.battleOrder = *(int *)((char *)ac + AC_BATTLEORDER);
-        a.objId       = *(uint32_t *)((char *)al + AL_OBJID);
-        float *p = (float *)((char *)al + AL_POSITION);
-        a.x = p[0]; a.y = p[1]; a.z = p[2];
-        int   *f = (int   *)((char *)al + AL_FORWARD);
-        a.fwd_x = f[0]; a.fwd_y = f[1]; a.fwd_z = f[2];
-        out.push_back(a);
-    }
-
-    // ===== Hero scan via GamePlayerCenter (v22) =====
-    // HeroActors path (v21) gave correct position/ObjID but camp/cfg=0 鈥?the
-    // ActorConfig stored there doesn't have player metadata populated.
-    // Real hero camp lives on Player.playerCamp.
-    // GamePlayerCenter singleton @ Assets.Scripts.GameSystem
-    //   m_playerLinkerList @ +0x18 = DictionaryView<uint, Player>
-    // Player layout:
-    //   playerCamp @ +0x08 (COM_PLAYERCAMP, Int32)
-    //   campPos    @ +0x0c (Int32 - 0-4 inside team in 5v5)
-    //   PlayerId   @ +0x20
-    //   captainConfigID @ +0x180 (hero config id)
-    //   Captain    @ +0x198 (PoolObjHandle<ActorConfig> 16 bytes, T* at +0x1A0)
-    static Il2CppClass *cached_gpc_klass = nullptr;
-    static FieldInfo *cached_gpc_s_inst = nullptr;
-    static Il2CppClass *cached_gpc_dv_klass = nullptr;
-    static int cached_gpc_off_ctx = -1;
-
-    if (!cached_gpc_klass) {
-        cached_gpc_klass = find_class_anywhere("Assets.Scripts.GameSystem", "GamePlayerCenter");
-        if (!cached_gpc_klass) return (int)out.size();
-        Il2CppClass *parent = il2cpp_class_get_parent(cached_gpc_klass);
-        cached_gpc_s_inst = il2cpp_class_get_field_from_name(parent, "s_instance");
-        if (!cached_gpc_s_inst) cached_gpc_s_inst = il2cpp_class_get_field_from_name(cached_gpc_klass, "s_instance");
-        if (!cached_gpc_s_inst) return (int)out.size();
+        if (!cached_s_inst)
+            cached_s_inst = il2cpp_class_get_field_from_name(cached_klass, "s_instance");
+        if (!cached_s_inst) { init_failed = true; return 0; }
     }
 
     void *gpc = nullptr;
-    il2cpp_field_static_get_value(cached_gpc_s_inst, &gpc);
-    if (!is_plausible_ptr(gpc)) return (int)out.size();
+    il2cpp_field_static_get_value(cached_s_inst, &gpc);
+    if (!is_plausible_ptr(gpc)) return 0;
 
-    void *p_dictview = *(void **)((char *)gpc + 0x18);  // m_playerLinkerList
-    if (!is_plausible_ptr(p_dictview)) return (int)out.size();
+    void *dictview = *(void **)((char *)gpc + GPC_PLAYER_LIST);
+    if (!is_plausible_ptr(dictview)) return 0;
 
-    if (!cached_gpc_dv_klass) {
-        cached_gpc_dv_klass = il2cpp_object_get_class((Il2CppObject *)p_dictview);
-        if (!cached_gpc_dv_klass) return (int)out.size();
-        FieldInfo *f_ctx = il2cpp_class_get_field_from_name(cached_gpc_dv_klass, "Context");
-        int raw = f_ctx ? il2cpp_field_get_offset(f_ctx) : 0;
-        cached_gpc_off_ctx = raw >= 0x10 ? raw : (raw + 0x10);
+    if (cached_dv_ctx < 0) {
+        Il2CppClass *dv_klass = il2cpp_object_get_class((Il2CppObject *)dictview);
+        FieldInfo *f_ctx = dv_klass ? il2cpp_class_get_field_from_name(dv_klass, "Context") : nullptr;
+        int raw = f_ctx ? il2cpp_field_get_offset(f_ctx) : 0x8;
+        cached_dv_ctx = raw >= 0x10 ? raw : (raw + 0x10);
+        LOGI("[esp v23] DictionaryView.Context @ +0x%x", cached_dv_ctx);
     }
 
-    void *p_dict = *(void **)((char *)p_dictview + cached_gpc_off_ctx);
-    if (!is_plausible_ptr(p_dict)) return (int)out.size();
+    void *dict = *(void **)((char *)dictview + cached_dv_ctx);
+    if (!is_plausible_ptr(dict)) return 0;
 
-    int p_count = *(int *)((char *)p_dict + 0x18);
-    void *p_entries = *(void **)((char *)p_dict + 0x10);
-    if (!is_plausible_ptr(p_entries) || p_count <= 0 || p_count > 32) {
-        return (int)out.size();
+    int   count   = *(int   *)((char *)dict + DICT_COUNT);
+    void *entries = *(void **)((char *)dict + DICT_ENTRIES);
+    if (!is_plausible_ptr(entries) || count <= 0 || count > 32) return 0;
+
+    // Walk up to count+free slots, scan generously since dictionary may be
+    // sparse after a player disconnect.
+    int scanned_live = 0;
+    for (int i = 0; i < count + 8 && scanned_live < count; ++i) {
+        if (i >= 32) break;
+        char *e = (char *)entries + ENTRIES_BASE + i * ENTRY_STRIDE;
+        int hashCode = *(int *)(e + 0);
+        int next     = *(int *)(e + 4);
+        if (hashCode < 0 && next < 0) continue;  // free slot
+        uint32_t key = *(uint32_t *)(e + ENTRY_KEY);
+        void *player = *(void **)(e + ENTRY_VALUE);
+        if (emit_player(player, key, out)) scanned_live++;
     }
-
-    for (int i = 0; i < p_count + 4 && i < 32; ++i) {
-        char *pe = (char *)p_entries + 0x18 + i * 24;
-        int p_hash = *(int *)(pe + 0);
-        int p_next = *(int *)(pe + 4);
-        uint32_t p_key = *(uint32_t *)(pe + 8);
-        void *player = *(void **)(pe + 16);
-        if (p_hash < 0 && p_next < 0) continue;
-        if (!is_plausible_ptr(player)) continue;
-
-        // v22.3 diagnostic: stuff player memory probes into EspActor.fwd_* fields so PC
-        // can read them directly (LOGI doesn't reach logcat for this thread for unknown reason).
-        // Captain at +0x198 is verified working; need to find where playerCamp / configId live.
-        int probe_a = *(int *)((char *)player + 0x8);    // candidate playerCamp (dump.cs)
-        int probe_b = *(int *)((char *)player + 0x18);   // candidate playerCamp (+0x10 header shift)
-        int probe_c = *(int *)((char *)player + 0x180);  // candidate captainConfigID (dump.cs)
-        int probe_d = *(int *)((char *)player + 0x190);  // candidate captainConfigID (+0x10 shift)
-
-        // Captain is PoolObjHandle<ActorConfig>, T* at handle+8 鈥?known working
-        char *cap_handle = (char *)player + 0x198;
-        void *hac = *(void **)(cap_handle + POOLHANDLE_T_PTR);
-        if (!is_plausible_ptr(hac)) continue;
-
-        void *hinner = *(void **)((char *)hac + AC_INNER);
-        if (!is_plausible_ptr(hinner)) continue;
-        void *hal = *(void **)((char *)hinner + INNER_LINKER);
-        if (!is_plausible_ptr(hal)) continue;
-
-        EspActor a;
-        a.key         = p_key;
-        a.type        = 0;        // HERO marker
-        a.configId    = probe_c;  // probe captainConfigID @ +0x180
-        a.camp        = probe_a;  // probe playerCamp @ +0x8
-        a.battleOrder = probe_b;  // probe playerCamp @ +0x18
-        a.objId       = *(uint32_t *)((char *)hal + AL_OBJID);
-        float *hp     = (float *)((char *)hal + AL_POSITION);
-        a.x = hp[0]; a.y = hp[1]; a.z = hp[2];
-        // fwd fields repurposed as diagnostic probes
-        a.fwd_x = probe_d;  // candidate captainConfigID @ +0x190
-        a.fwd_y = (int)((uintptr_t)player & 0xFFFFFFFF);       // low 32 of player ptr
-        a.fwd_z = (int)((uintptr_t)player >> 32);              // high 32 of player ptr
-        out.push_back(a);
-    }
-
     return (int)out.size();
 }
 
-// Send the current snapshot to a single client fd. Returns false on socket error.
 static bool send_snapshot(int fd, const std::vector<EspActor> &actors) {
     EspHeader hdr;
     memcpy(hdr.magic, "ESP1", 4);
@@ -295,17 +228,16 @@ static bool send_snapshot(int fd, const std::vector<EspActor> &actors) {
 
     struct msghdr msg = {};
     msg.msg_iov    = iov;
-    msg.msg_iovlen = 2;
+    msg.msg_iovlen = (actors.empty()) ? 1 : 2;
 
     ssize_t n = sendmsg(fd, &msg, MSG_NOSIGNAL);
     return n > 0;
 }
 
-// Server thread: bind TCP loopback, accept one client at a time, hand fd to global
 static void server_thread() {
-    LOGI("[esp v22] server thread, tid=%d", gettid());
+    LOGI("[esp v23] server thread, tid=%d", gettid());
     int srv = socket(AF_INET, SOCK_STREAM, 0);
-    if (srv < 0) { LOGE("[esp v22] socket() errno=%d", errno); return; }
+    if (srv < 0) { LOGE("[esp v23] socket() errno=%d", errno); return; }
 
     int yes = 1;
     setsockopt(srv, SOL_SOCKET, SO_REUSEADDR, &yes, sizeof(yes));
@@ -316,49 +248,54 @@ static void server_thread() {
     addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
 
     if (bind(srv, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
-        LOGE("[esp v22] bind 127.0.0.1:%d errno=%d", SOCK_PORT, errno);
+        LOGE("[esp v23] bind 127.0.0.1:%d errno=%d", SOCK_PORT, errno);
         close(srv);
         return;
     }
     if (listen(srv, 4) < 0) {
-        LOGE("[esp v22] listen errno=%d", errno);
+        LOGE("[esp v23] listen errno=%d", errno);
         close(srv);
         return;
     }
-    LOGI("[esp v22] listening on 127.0.0.1:%d", SOCK_PORT);
+    LOGI("[esp v23] listening on 127.0.0.1:%d", SOCK_PORT);
 
     while (true) {
         int cli = accept(srv, nullptr, nullptr);
         if (cli < 0) {
             if (errno == EINTR) continue;
-            LOGE("[esp v22] accept errno=%d", errno);
+            LOGE("[esp v23] accept errno=%d", errno);
             sleep(1);
             continue;
         }
-        LOGI("[esp v22] client connected fd=%d", cli);
+        LOGI("[esp v23] client connected fd=%d", cli);
         int old = g_client_fd.exchange(cli);
         if (old >= 0) close(old);
     }
 }
 
-// Scanner thread: every 500 ms, scan + send if client connected
 static void scan_thread() {
-    LOGI("[esp v22] scan thread, tid=%d", gettid());
-    sleep(45);  // shorter warmup; ActorManager usually ready by 30s but be safe
-    LOGI("[esp v22] scan loop starting");
+    LOGI("[esp v23] scan thread, tid=%d", gettid());
+    sleep(45);  // wait for ActorManager / GamePlayerCenter to populate (loading screen + spawn)
+    LOGI("[esp v23] scan loop starting");
 
+    int empty_streak = 0;
     while (true) {
-        usleep(150 * 1000);  // 150 ms period (~6.7 Hz)
+        usleep(150 * 1000);  // ~6.7 Hz
 
         int fd = g_client_fd.load();
-        if (fd < 0) continue;  // no client, skip work
+        if (fd < 0) continue;
 
         std::vector<EspActor> actors;
-        int n = scan_actors(actors);
-        if (n == 0) continue;
+        int n = scan_heroes(actors);
+
+        // Diagnostic: log heartbeat every ~3s while client is up.
+        if (++empty_streak >= 20) {
+            empty_streak = 0;
+            LOGI("[esp v23] tick n=%d", n);
+        }
 
         if (!send_snapshot(fd, actors)) {
-            LOGI("[esp v22] client disconnected, closing fd=%d", fd);
+            LOGI("[esp v23] client disconnected, closing fd=%d", fd);
             close(fd);
             g_client_fd.store(-1);
         }
@@ -366,7 +303,7 @@ static void scan_thread() {
 }
 
 void esp_start(const char *game_data_dir) {
-    LOGI("[esp v22] esp_start");
+    LOGI("[esp v23] esp_start");
     std::thread srv(server_thread);
     srv.detach();
     std::thread scn(scan_thread);
