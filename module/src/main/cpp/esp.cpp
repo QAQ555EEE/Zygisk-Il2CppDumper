@@ -159,37 +159,87 @@ static void refresh_display_data() {
         return;
     }
 
-    // v37: bypass il2cpp_runtime_invoke trampoline -- ACE monitors managed→native
-    // transitions through the trampoline. Read the raw native function pointer
-    // out of MethodInfo and call it directly so the stack frame above looks
-    // like one native fn calling another with no IL2CPP runtime in between.
+    // v38: ABSOLUTELY NO method invoke. v37 proved calling methodPointer
+    // directly also triggers ACE -- it monitors the native function entry
+    // (likely a caller-LR check inside the native fn that requires LR to
+    // land inside libil2cpp's InvokerMethod trampoline range).
     //
-    // MethodInfo layout (aarch64 Il2Cpp standard):
-    //   +0x00 methodPointer (Il2CppMethodPointer = void* native fn ptr)
-    //   +0x08 invoker_method
-    //   ...
+    // Instead, only READ memory:
+    //   1) lookup MethodInfo (safe -- metadata only, no code execution)
+    //   2) read methodPointer (8-byte pointer load -- still no execution)
+    //   3) read the bytes that methodPointer points to (.text read, no jump)
+    //   4) ARM64 disasm the bytes locally to find the global-var address
+    //      the native fn would have returned, and read THAT memory directly.
     //
-    // SGW.GetDisplayData() is a static no-arg method that returns DisplayInfoData*.
-    // The native trampoline ABI in IL2CPP passes the MethodInfo as the last hidden
-    // arg, so we call as `fn(methodInfo)` to be safe.
-    typedef void *(*GetDataFn)(const MethodInfo *);
-    typedef uint32_t (*GetCountFn)(const MethodInfo *);
-    void *raw_data_fn  = *(void **)((char *)cached_m_data + 0x00);
-    void *raw_count_fn = *(void **)((char *)cached_m_count + 0x00);
-    if (!raw_data_fn || !raw_count_fn) {
-        g_disp_buf = nullptr; g_disp_count = 0; return;
-    }
-    void     *buf = ((GetDataFn)raw_data_fn)(cached_m_data);
-    uint32_t  cnt = ((GetCountFn)raw_count_fn)(cached_m_count);
-    g_disp_buf   = buf;
-    g_disp_count = cnt;
+    // No managed→native call ever happens, so there's no caller LR for ACE
+    // to validate.  Reading .text is a normal page read on r-xp memory.
+    void *raw_data_fn = *(void **)((char *)cached_m_data + 0x00);
+    if (!raw_data_fn) { g_disp_buf = nullptr; g_disp_count = 0; return; }
 
-    if (!init_logged_ok && g_disp_buf && g_disp_count) {
-        LOGI("[esp v37] SGW first frame (direct methodPointer): buf=%p count=%u",
-             g_disp_buf, g_disp_count);
-        LOGI("[esp v37] methodPointers: data_fn=%p count_fn=%p", raw_data_fn, raw_count_fn);
+    // Find the global variable address that GetDisplayData would return.
+    // Walk up to 16 instructions from fn entry looking for an ADRP+LDR pair
+    // (the canonical "return s_global;" pattern on aarch64).
+    //
+    //   ADRP Xd, page          encoded: imm21 split (immlo|immhi), opcode 0x90/0xB0
+    //   LDR  Xt, [Xn, #imm]    encoded: 0xF940... (LDR 64-bit unsigned imm)
+    //   RET                    0xD65F03C0
+    //
+    // imm21 = sign_extend((immhi:immlo) << 12)
+    // adrp_target = (PC & ~0xFFF) + imm21
+    // ldr_offset  = imm12 << 3   (64-bit scale)
+    static const void *cached_global_addr = nullptr;
+    if (!cached_global_addr) {
+        const uint32_t *insns = (const uint32_t *)raw_data_fn;
+        for (int i = 0; i < 16; ++i) {
+            uint32_t a = insns[i];
+            uint32_t b = insns[i + 1];
+            bool is_adrp = (a & 0x9F000000) == 0x90000000;
+            bool is_ldr  = (b & 0xFFC00000) == 0xF9400000;  // LDR Xt, [Xn, #imm12]
+            if (!is_adrp || !is_ldr) continue;
+            int rd_adrp = a & 0x1F;
+            int rn_ldr  = (b >> 5) & 0x1F;
+            if (rd_adrp != rn_ldr) continue;
+            int64_t immlo = (a >> 29) & 0x3;
+            int64_t immhi = (a >> 5) & 0x7FFFF;
+            int64_t imm = (immhi << 2) | immlo;
+            if (imm & (1LL << 20)) imm |= ~((1LL << 21) - 1);
+            imm <<= 12;
+            uintptr_t pc = (uintptr_t)(insns + i);
+            uintptr_t adrp_target = (pc & ~0xFFFLL) + imm;
+            uint32_t imm12 = (b >> 10) & 0xFFF;
+            uintptr_t global = adrp_target + ((uintptr_t)imm12 << 3);
+            cached_global_addr = (const void *)global;
+            LOGI("[esp v38] disasm found ADRP+LDR @ insn[%d]: fn=%p adrp_pc=%p adrp_target=%p ldr_off=%#x global=%p",
+                 i, raw_data_fn, (void *)pc, (void *)adrp_target, imm12 << 3, (void *)global);
+            break;
+        }
+        if (!cached_global_addr) {
+            // dump first 64 bytes for offline RE if pattern missed
+            const uint64_t *q = (const uint64_t *)raw_data_fn;
+            LOGI("[esp v38] no ADRP+LDR pattern in fn @ %p -- hex: %016llx %016llx %016llx %016llx %016llx %016llx %016llx %016llx",
+                 raw_data_fn,
+                 (unsigned long long)q[0], (unsigned long long)q[1],
+                 (unsigned long long)q[2], (unsigned long long)q[3],
+                 (unsigned long long)q[4], (unsigned long long)q[5],
+                 (unsigned long long)q[6], (unsigned long long)q[7]);
+            return;
+        }
+    }
+
+    // Read the global -- this should be the current frame's DisplayInfoData*.
+    // No function call: just a pointer dereference of a known native global.
+    void *buf = *(void **)cached_global_addr;
+    g_disp_buf = buf;
+
+    // Apply same trick to GetDisplayData_Count -- but optimistically:
+    // its native fn likely loads count from a global at the same/neighboring
+    // page. Skip for now; emit code can decide count by walking until actorID==0.
+    g_disp_count = 256;  // upper-bound walk; emit will stop at actorID==0
+
+    if (!init_logged_ok && g_disp_buf) {
+        LOGI("[esp v38] SGW global cache: addr=%p buf=%p", cached_global_addr, g_disp_buf);
         const uint64_t *q = (const uint64_t *)g_disp_buf;
-        LOGI("[esp v37] disp[0] hex: %016llx %016llx %016llx %016llx %016llx %016llx %016llx %016llx",
+        LOGI("[esp v38] disp[0] hex: %016llx %016llx %016llx %016llx %016llx %016llx %016llx %016llx",
              (unsigned long long)q[0], (unsigned long long)q[1],
              (unsigned long long)q[2], (unsigned long long)q[3],
              (unsigned long long)q[4], (unsigned long long)q[5],
@@ -449,6 +499,7 @@ static int scan_heroes(std::vector<EspActor> &out) {
                                 for (uint32_t i = 0; i < g_disp_count && i < 256; ++i) {
                                     const char *e = (const char *)g_disp_buf + i * stride;
                                     uint32_t aid = *(const uint32_t *)e;
+                                    if (aid == 0) break;  // v38 sentinel: end-of-array
                                     if (aid == want) {
                                         // Try +0x10 (managed-style layout) and +0x18 (declared offset)
                                         float *cand = (float *)(e + 0x10);
