@@ -176,25 +176,34 @@ static void refresh_display_data() {
     void *raw_data_fn = *(void **)((char *)cached_m_data + 0x00);
     if (!raw_data_fn) { g_disp_buf = nullptr; g_disp_count = 0; return; }
 
-    // Find the global variable address that GetDisplayData would return.
-    // Walk up to 16 instructions from fn entry looking for an ADRP+LDR pair
-    // (the canonical "return s_global;" pattern on aarch64).
-    //
-    //   ADRP Xd, page          encoded: imm21 split (immlo|immhi), opcode 0x90/0xB0
-    //   LDR  Xt, [Xn, #imm]    encoded: 0xF940... (LDR 64-bit unsigned imm)
-    //   RET                    0xD65F03C0
-    //
-    // imm21 = sign_extend((immhi:immlo) << 12)
-    // adrp_target = (PC & ~0xFFF) + imm21
-    // ldr_offset  = imm12 << 3   (64-bit scale)
+    // v39: also dump the full fn bytecode and find ALL ADRP+LDR pairs.
+    // v38's first-match returned insn[7]'s ADRP which led to a non-buffer ptr.
+    // The real "return s_buffer" load is likely AFTER the prologue/setup
+    // (maybe also after a tail call or before a RET).  We dump all pairs and
+    // both pick the one whose deref looks most like a managed-heap pointer
+    // (high byte 0xb4 indicates ART managed obj) -- and log all candidates
+    // so we can manually choose later if the heuristic misses.
     static const void *cached_global_addr = nullptr;
     if (!cached_global_addr) {
         const uint32_t *insns = (const uint32_t *)raw_data_fn;
-        for (int i = 0; i < 16; ++i) {
+        // Dump 32 instructions (128 bytes) to logcat for offline RE.
+        LOGI("[esp v39] fn @ %p first 128 bytes (32 ARM64 insns):", raw_data_fn);
+        for (int row = 0; row < 8; ++row) {
+            LOGI("[esp v39]   insn[%2d..%2d]: %08x %08x %08x %08x",
+                 row * 4, row * 4 + 3,
+                 insns[row * 4 + 0], insns[row * 4 + 1],
+                 insns[row * 4 + 2], insns[row * 4 + 3]);
+        }
+        // Try every ADRP+LDR pair in the first 32 instructions; log each
+        // candidate's target value and pick the one whose deref looks like a
+        // managed-heap ptr (top byte 0xb4 on aarch64 ART).
+        int chosen_idx = -1;
+        uintptr_t chosen_global = 0;
+        for (int i = 0; i < 30; ++i) {
             uint32_t a = insns[i];
             uint32_t b = insns[i + 1];
             bool is_adrp = (a & 0x9F000000) == 0x90000000;
-            bool is_ldr  = (b & 0xFFC00000) == 0xF9400000;  // LDR Xt, [Xn, #imm12]
+            bool is_ldr  = (b & 0xFFC00000) == 0xF9400000;
             if (!is_adrp || !is_ldr) continue;
             int rd_adrp = a & 0x1F;
             int rn_ldr  = (b >> 5) & 0x1F;
@@ -208,20 +217,20 @@ static void refresh_display_data() {
             uintptr_t adrp_target = (pc & ~0xFFFLL) + imm;
             uint32_t imm12 = (b >> 10) & 0xFFF;
             uintptr_t global = adrp_target + ((uintptr_t)imm12 << 3);
-            cached_global_addr = (const void *)global;
-            LOGI("[esp v38] disasm found ADRP+LDR @ insn[%d]: fn=%p adrp_pc=%p adrp_target=%p ldr_off=%#x global=%p",
-                 i, raw_data_fn, (void *)pc, (void *)adrp_target, imm12 << 3, (void *)global);
-            break;
+            uint64_t deref = *(uint64_t *)global;
+            int top_byte = (int)((deref >> 56) & 0xFF);
+            LOGI("[esp v39]   cand insn[%d]: global=%p deref=%#018llx top=%02x %s",
+                 i, (void *)global, (unsigned long long)deref, top_byte,
+                 (top_byte == 0xb4) ? " <-- looks managed" : "");
+            if (top_byte == 0xb4 && chosen_idx < 0) {
+                chosen_idx = i; chosen_global = global;
+            }
         }
-        if (!cached_global_addr) {
-            // dump first 64 bytes for offline RE if pattern missed
-            const uint64_t *q = (const uint64_t *)raw_data_fn;
-            LOGI("[esp v38] no ADRP+LDR pattern in fn @ %p -- hex: %016llx %016llx %016llx %016llx %016llx %016llx %016llx %016llx",
-                 raw_data_fn,
-                 (unsigned long long)q[0], (unsigned long long)q[1],
-                 (unsigned long long)q[2], (unsigned long long)q[3],
-                 (unsigned long long)q[4], (unsigned long long)q[5],
-                 (unsigned long long)q[6], (unsigned long long)q[7]);
+        if (chosen_global) {
+            cached_global_addr = (const void *)chosen_global;
+            LOGI("[esp v39] picked global @ insn[%d] = %p", chosen_idx, (void *)chosen_global);
+        } else {
+            LOGI("[esp v39] no good ADRP+LDR candidate found, falling back to ActorLinker.position");
             return;
         }
     }
