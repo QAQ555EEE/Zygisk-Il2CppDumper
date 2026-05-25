@@ -621,6 +621,31 @@ static int scan_heroes(std::vector<EspActor> &out) {
                         // thread loop below, then we resolve each actor's
                         // entry by actorID == ActorLinker.ObjID@+0x4AC.
                         float *p = (float *)((char *)al + 0x4C4);  // fallback
+
+                        // v45 (Wwise probe): brainstorm angle — Wwise spatial
+                        // audio engine must know every emitter's true 3D
+                        // position even when actor is FOW'd (otherwise full-map
+                        // ultimate sound effects wouldn't pan correctly).
+                        // Chain: ActorLinker+0x450 → ActorSoundComponent
+                        //        + 0x40 → AkGameObj
+                        //        + 0x24 → Vector3 m_position
+                        // Just READ — no method call, no .text touch, ACE-safe.
+                        // If FOW-filtered actor's AkGameObj.m_position is still
+                        // realtime → BREAKTHROUGH.
+                        void *sc = *(void **)((char *)al + 0x450);
+                        if (is_plausible_ptr(sc)) {
+                            void *ako = *(void **)((char *)sc + 0x40);
+                            if (is_plausible_ptr(ako)) {
+                                float *wpos = (float *)((char *)ako + 0x24);
+                                static int wlog_count = 0;
+                                if (wlog_count < 30) {
+                                    uint32_t akid = *(uint32_t *)((char *)ako + 0x50);
+                                    LOGI("[esp v45] actor key=%u AL.pos=(%.1f,%.1f,%.1f) AkGameObj.pos=(%.1f,%.1f,%.1f) akID=%u",
+                                         key, p[0], p[1], p[2], wpos[0], wpos[1], wpos[2], akid);
+                                    wlog_count++;
+                                }
+                            }
+                        }
                         if (g_disp_buf && g_disp_count) {
                             uint32_t want = a.objId;
                             // v39: SGW.GetDisplayData() returns a managed wrapper.
