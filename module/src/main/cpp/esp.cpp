@@ -396,9 +396,10 @@ static int scan_heroes(std::vector<EspActor> &out) {
     // Walk CullingGroupMgr.indexMap (Dictionary<int, CullingNode>) once,
     // dump first 2 actors' CullingNode + Transform memory so we can RE the
     // managed→native Transform layout in this sgame Unity build.
+    // v44: only mark probed *after* inst was non-NULL (CullingGroupMgr is
+    // instantiated lazily once a match starts, not in the lobby).
     static bool culling_probed = false;
     if (!culling_probed) {
-        culling_probed = true;
         Il2CppClass *cg_klass = find_class_anywhere("Assets.Scripts.GameLogic", "CullingGroupMgr");
         if (cg_klass) {
             Il2CppClass *parent_c = il2cpp_class_get_parent(cg_klass);
@@ -407,6 +408,7 @@ static int scan_heroes(std::vector<EspActor> &out) {
             void *cg = nullptr;
             if (cg_sinst) il2cpp_field_static_get_value(cg_sinst, &cg);
             if (is_plausible_ptr(cg)) {
+                culling_probed = true;  // only set once we got real data
                 LOGI("[esp v43] CullingGroupMgr inst=%p", cg);
                 void *idx_dict = *(void **)((char *)cg + 0x10);
                 LOGI("[esp v43] indexMap=%p isActive=%d", idx_dict, *(int *)((char *)cg + 0x08));
