@@ -1,5 +1,10 @@
 //
-// ESP loop v4: hex-dump am_instance + HeroActors object to diagnose empty lists
+// ESP loop v5: reflect Dictionary layout + dump ActorConfig
+// Approach: ActorManager.actorList is DictionaryView<UInt32, ActorConfig>, the
+// 11 TinyValueLists are empty in this sgame build. The real actor data is in
+// actorList.Context (Dictionary). Use IL2CPP API to find _entries / _count
+// true offsets (Tencent may have shuffled fields), then walk entries to dump
+// ActorConfig payload to confirm ConfigID + ActorLinker (inner @ +0x50) path.
 //
 
 #include "esp.h"
@@ -21,12 +26,6 @@
 #define OFF_OBJID_IN_LINKER       0x4AC
 
 struct Vector3 { float x, y, z; };
-
-static const char *TINY_LISTS[] = {
-    "HeroActors", "OrganActors", "TowerActors", "SoldierActors",
-    "DragonActors", "VehicleActors", "BuffMonsterActors", "SpringActors",
-    "CallMonsterActors", "CallActors", "SacredAnimalActors", nullptr
-};
 
 static void hexdump(const char *label, const void *p, size_t len) {
     if (!p) { LOGI("[esp] %s: NULL", label); return; }
@@ -56,6 +55,15 @@ static const Il2CppImage *find_image_with_actormanager() {
     return nullptr;
 }
 
+// Probe a candidate field by name on a class; log offset if found
+static int probe_offset(Il2CppClass *klass, const char *name) {
+    FieldInfo *f = il2cpp_class_get_field_from_name(klass, name);
+    if (!f) { LOGI("[esp]   field '%s' NOT FOUND on klass", name); return -1; }
+    int off = il2cpp_field_get_offset(f);
+    LOGI("[esp]   field '%s' offset=0x%x", name, off);
+    return off;
+}
+
 static void esp_loop(const char *game_data_dir) {
     LOGI("[esp] thread start, tid=%d", gettid());
     sleep(30);
@@ -72,21 +80,13 @@ static void esp_loop(const char *game_data_dir) {
     if (!s_inst_field) s_inst_field = il2cpp_class_get_field_from_name(am_klass, "s_instance");
     if (!s_inst_field) { LOGE("[esp] s_instance not found"); return; }
 
-    FieldInfo *list_fields[16] = {0};
-    size_t list_offsets[16] = {0};
-    int n_lists = 0;
-    for (int i = 0; TINY_LISTS[i]; i++) {
-        FieldInfo *f = il2cpp_class_get_field_from_name(am_klass, TINY_LISTS[i]);
-        if (f) {
-            list_fields[n_lists] = f;
-            list_offsets[n_lists] = il2cpp_field_get_offset(f);
-            n_lists++;
-        }
-    }
+    // Probe ActorManager.actorList offset (instance field)
+    FieldInfo *f_actorList = il2cpp_class_get_field_from_name(am_klass, "actorList");
+    int off_actorList = f_actorList ? il2cpp_field_get_offset(f_actorList) : -1;
+    LOGI("[esp] ActorManager.actorList offset=0x%x", off_actorList);
 
     int iter = 0;
-    bool dumped_once = false;
-    int last_nonzero_idx = -1;
+    bool diag_done = false;
     while (true) {
         sleep(1);
         iter++;
@@ -98,56 +98,89 @@ static void esp_loop(const char *game_data_dir) {
             continue;
         }
 
-        if (!dumped_once) {
-            LOGI("[esp] ===== DIAGNOSTIC DUMP =====");
-            LOGI("[esp] am=%p", am);
-            hexdump("am", am, 0x90);
+        if (!diag_done && off_actorList >= 0) {
+            LOGI("[esp] ===== DIAG v5 =====");
+            void *dictview = *(void **)((char *)am + off_actorList);
+            LOGI("[esp] am=%p dictview=%p", am, dictview);
+            if (!dictview) { LOGE("[esp] dictview NULL"); diag_done = true; continue; }
 
-            for (int i = 0; i < n_lists; i++) {
-                void *list_obj = *(void **)((char *)am + list_offsets[i]);
-                char label[64];
-                snprintf(label, sizeof(label), "%s_obj(%p)", TINY_LISTS[i], list_obj);
-                hexdump(label, list_obj, 0x30);
+            // dictview: DictionaryView<UInt32, ActorConfig> — has one field 'Context' (Dictionary<,>)
+            Il2CppClass *dv_klass = il2cpp_object_get_class((Il2CppObject *)dictview);
+            LOGI("[esp] dv_klass=%p name=%s", dv_klass, dv_klass ? il2cpp_class_get_name(dv_klass) : "?");
+            FieldInfo *f_context = il2cpp_class_get_field_from_name(dv_klass, "Context");
+            int off_ctx = f_context ? il2cpp_field_get_offset(f_context) : 0x10;
+            LOGI("[esp] DictionaryView.Context offset=0x%x", off_ctx);
+            void *dict = *(void **)((char *)dictview + off_ctx);
+            LOGI("[esp] dict=%p", dict);
+            if (!dict) { LOGE("[esp] dict NULL"); diag_done = true; continue; }
+
+            // Reflect Dictionary<TKey,TValue> field offsets
+            Il2CppClass *dict_klass = il2cpp_object_get_class((Il2CppObject *)dict);
+            LOGI("[esp] dict_klass=%p name=%s", dict_klass, dict_klass ? il2cpp_class_get_name(dict_klass) : "?");
+            int off_count = probe_offset(dict_klass, "_count");
+            int off_entries = probe_offset(dict_klass, "_entries");
+            int off_buckets = probe_offset(dict_klass, "_buckets");
+            int off_comparer = probe_offset(dict_klass, "_comparer");
+            int off_freelist = probe_offset(dict_klass, "_freeList");
+            int off_freecount = probe_offset(dict_klass, "_freeCount");
+
+            // Wider hexdump of dict to align bytes with reported offsets
+            hexdump("dict", dict, 0x80);
+
+            // Read count + entries via reflected offsets
+            if (off_count >= 0 && off_entries >= 0) {
+                int count = *(int *)((char *)dict + off_count);
+                void *entries = *(void **)((char *)dict + off_entries);
+                LOGI("[esp] count=%d entries=%p", count, entries);
+                if (entries) {
+                    // IL2CPP array: +0x18 = max_length (size_t), +0x20 = first element
+                    uint64_t len = *(uint64_t *)((char *)entries + 0x18);
+                    LOGI("[esp] entries.length=%llu", (unsigned long long)len);
+                    hexdump("entries_hdr", entries, 0x40);
+
+                    // Probe Entry struct stride: standard mscorlib Entry is
+                    // { int hashCode; int next; TKey key; TValue value }
+                    // For Dictionary<UInt32, ActorConfig>: hashCode(4)+next(4)+key(4)+pad(4)+value(8) = 24 bytes
+                    // For sgame variants it may differ — dump first few raw bytes.
+                    hexdump("entries_e0", (char *)entries + 0x20, 0x60);
+                    hexdump("entries_e1", (char *)entries + 0x20 + 0x18, 0x60);
+                    hexdump("entries_e2", (char *)entries + 0x20 + 0x30, 0x60);
+                }
             }
 
-            void *dictview = *(void **)((char *)am + 0x8);
-            hexdump("actorList_dv", dictview, 0x30);
+            // Try to find ActorConfig class and reflect 'inner' offset
+            Il2CppClass *acfg_klass = il2cpp_class_from_name(img, "Assets.Scripts.GameLogic", "ActorConfig");
+            if (acfg_klass) {
+                LOGI("[esp] ActorConfig klass=%p", acfg_klass);
+                probe_offset(acfg_klass, "inner");
+                probe_offset(acfg_klass, "ConfigID");
+                probe_offset(acfg_klass, "ActorType");
+                probe_offset(acfg_klass, "CmpType");
+            } else {
+                LOGE("[esp] ActorConfig class not found in image");
+            }
+
+            LOGI("[esp] ===== END DIAG v5 =====");
+            diag_done = true;
+        }
+
+        // Periodic heartbeat — show dict count to confirm it's filling
+        if (diag_done && iter % 5 == 0 && off_actorList >= 0) {
+            void *dictview = *(void **)((char *)am + off_actorList);
             if (dictview) {
-                void *dict = *(void **)((char *)dictview + 0x10);
-                hexdump("actorList_dict", dict, 0x60);
-            }
-
-            LOGI("[esp] ===== END DUMP =====");
-            dumped_once = true;
-        }
-
-        if (iter % 5 == 0) {
-            char buf[768];
-            int p = 0;
-            for (int i = 0; i < n_lists; i++) {
-                void *list_obj = *(void **)((char *)am + list_offsets[i]);
-                int32_t sz = list_obj ? *(int32_t *)((char *)list_obj + 0x18) : -1;
-                p += snprintf(buf+p, sizeof(buf)-p, "%s=%d ", TINY_LISTS[i], sz);
-                if (sz > 0 && sz < 200) last_nonzero_idx = i;
-            }
-            LOGI("[esp] iter %d am=%p %s", iter, am, buf);
-        }
-
-        if (last_nonzero_idx >= 0) {
-            void *list_obj = *(void **)((char *)am + list_offsets[last_nonzero_idx]);
-            if (!list_obj) continue;
-            int32_t sz = *(int32_t *)((char *)list_obj + 0x18);
-            if (sz <= 0 || sz > 64) continue;
-            void *backing = *(void **)((char *)list_obj + 0x10);
-            if (!backing) continue;
-            void **elements = (void **)((char *)backing + 0x20);
-            for (int32_t i = 0; i < sz && i < 16; i++) {
-                void *linker = elements[i];
-                if (!linker) continue;
-                uint32_t objId = *(uint32_t *)((char *)linker + OFF_OBJID_IN_LINKER);
-                Vector3 *pos = (Vector3 *)((char *)linker + OFF_POSITION_IN_LINKER);
-                LOGI("[esp]   %s[%d] obj=%u pos=(%.1f,%.1f,%.1f)",
-                     TINY_LISTS[last_nonzero_idx], i, objId, pos->x, pos->y, pos->z);
+                void *dict = *(void **)((char *)dictview + 0x10); // fallback offset
+                if (dict) {
+                    // _count probed inline below since we don't keep state — re-reflect once per heartbeat to stay correct
+                    static Il2CppClass *cached_dk = nullptr;
+                    static int cached_off_count = -1;
+                    if (!cached_dk) {
+                        cached_dk = il2cpp_object_get_class((Il2CppObject *)dict);
+                        FieldInfo *fc = il2cpp_class_get_field_from_name(cached_dk, "_count");
+                        if (fc) cached_off_count = il2cpp_field_get_offset(fc);
+                    }
+                    int c = cached_off_count >= 0 ? *(int *)((char *)dict + cached_off_count) : -1;
+                    LOGI("[esp] iter %d dict count=%d", iter, c);
+                }
             }
         }
     }
