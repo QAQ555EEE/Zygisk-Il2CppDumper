@@ -35,9 +35,8 @@
 #undef DO_API
 
 // ===== layout offsets (verified by v10) =====
-// AM+0x10 = updatableActorList (Dict<uint, ActorConfig*>) - safe to walk
-// AM+0x8 actorList stores different value type and crashes on cast
-#define AM_UPDATABLE_LIST   0x10
+#define AM_UPDATABLE_LIST   0x10  // Dict<uint, ActorConfig*> - organ/monster/soldier only
+#define AM_HERO_ACTORS      0x18  // TinyValueList<PoolObjHandle<ActorConfig>> - heroes
 #define AC_ACTORTYPE        0x18
 #define AC_CONFIGID         0x1c
 #define AC_CMPTYPE          0x20
@@ -47,6 +46,23 @@
 #define AL_OBJID            0x4AC
 #define AL_FORWARD          0x4B8
 #define AL_POSITION         0x4C4
+
+// TinyValueList (AbstractBaseTinyList<T>) managed obj layout:
+//   +0x00 klass*  +0x08 monitor  +0x10 Item_Backends (T[])  +0x18 Size (int32)
+// Il2CppArray on aarch64: 0x20 header, elements at +0x20
+// PoolObjHandle<ActorConfig>: 16 bytes (seq uint32 + 4 pad + ActorConfig* at +8)
+#define TVL_ITEMS           0x10
+#define TVL_SIZE            0x18
+#define ARRAY_ELEMENTS      0x20
+#define POOLHANDLE_STRIDE   16
+#define POOLHANDLE_T_PTR    8
+
+// Pointer plausibility: must be in mmap range (above 0x10000) and 8-byte aligned.
+// This catches the 0x1f / 0x57 garbage values that crashed v17/v19.
+static inline bool is_plausible_ptr(const void *p) {
+    uintptr_t v = (uintptr_t)p;
+    return v >= 0x10000 && (v & 7) == 0;
+}
 
 // ===== protocol =====
 #pragma pack(push, 1)
@@ -168,6 +184,43 @@ static int scan_actors(std::vector<EspActor> &out) {
         a.fwd_x = f[0]; a.fwd_y = f[1]; a.fwd_z = f[2];
         out.push_back(a);
     }
+
+    // ===== HeroActors scan (v21) =====
+    // ActorManager.HeroActors @ +0x18 = TinyValueList<PoolObjHandle<ActorConfig>>
+    // Plausibility-checked at every deref to avoid v17/v19-style crashes.
+    void *hero_tvl = *(void **)((char *)am + AM_HERO_ACTORS);
+    if (!is_plausible_ptr(hero_tvl)) return (int)out.size();
+
+    int hero_size = *(int *)((char *)hero_tvl + TVL_SIZE);
+    void *hero_arr = *(void **)((char *)hero_tvl + TVL_ITEMS);
+    if (!is_plausible_ptr(hero_arr) || hero_size <= 0 || hero_size > 64) {
+        return (int)out.size();
+    }
+
+    for (int i = 0; i < hero_size; ++i) {
+        char *elem = (char *)hero_arr + ARRAY_ELEMENTS + i * POOLHANDLE_STRIDE;
+        void *hac = *(void **)(elem + POOLHANDLE_T_PTR);  // ActorConfig*
+        if (!is_plausible_ptr(hac)) continue;
+
+        void *hinner = *(void **)((char *)hac + AC_INNER);
+        if (!is_plausible_ptr(hinner)) continue;
+        void *hal = *(void **)((char *)hinner + INNER_LINKER);
+        if (!is_plausible_ptr(hal)) continue;
+
+        EspActor a;
+        a.key         = (uint32_t)i;   // index in HeroActors as pseudo-key
+        a.type        = *(int *)((char *)hac + AC_ACTORTYPE);     // expected 0 (HERO)
+        a.configId    = *(int *)((char *)hac + AC_CONFIGID);
+        a.camp        = *(int *)((char *)hac + AC_CMPTYPE);
+        a.battleOrder = *(int *)((char *)hac + AC_BATTLEORDER);
+        a.objId       = *(uint32_t *)((char *)hal + AL_OBJID);
+        float *hp     = (float *)((char *)hal + AL_POSITION);
+        a.x = hp[0]; a.y = hp[1]; a.z = hp[2];
+        int   *hf     = (int *)((char *)hal + AL_FORWARD);
+        a.fwd_x = hf[0]; a.fwd_y = hf[1]; a.fwd_z = hf[2];
+        out.push_back(a);
+    }
+
     return (int)out.size();
 }
 
@@ -193,9 +246,9 @@ static bool send_snapshot(int fd, const std::vector<EspActor> &actors) {
 
 // Server thread: bind TCP loopback, accept one client at a time, hand fd to global
 static void server_thread() {
-    LOGI("[esp v12] server thread, tid=%d", gettid());
+    LOGI("[esp v21] server thread, tid=%d", gettid());
     int srv = socket(AF_INET, SOCK_STREAM, 0);
-    if (srv < 0) { LOGE("[esp v12] socket() errno=%d", errno); return; }
+    if (srv < 0) { LOGE("[esp v21] socket() errno=%d", errno); return; }
 
     int yes = 1;
     setsockopt(srv, SOL_SOCKET, SO_REUSEADDR, &yes, sizeof(yes));
@@ -206,26 +259,26 @@ static void server_thread() {
     addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
 
     if (bind(srv, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
-        LOGE("[esp v12] bind 127.0.0.1:%d errno=%d", SOCK_PORT, errno);
+        LOGE("[esp v21] bind 127.0.0.1:%d errno=%d", SOCK_PORT, errno);
         close(srv);
         return;
     }
     if (listen(srv, 4) < 0) {
-        LOGE("[esp v12] listen errno=%d", errno);
+        LOGE("[esp v21] listen errno=%d", errno);
         close(srv);
         return;
     }
-    LOGI("[esp v12] listening on 127.0.0.1:%d", SOCK_PORT);
+    LOGI("[esp v21] listening on 127.0.0.1:%d", SOCK_PORT);
 
     while (true) {
         int cli = accept(srv, nullptr, nullptr);
         if (cli < 0) {
             if (errno == EINTR) continue;
-            LOGE("[esp v12] accept errno=%d", errno);
+            LOGE("[esp v21] accept errno=%d", errno);
             sleep(1);
             continue;
         }
-        LOGI("[esp v12] client connected fd=%d", cli);
+        LOGI("[esp v21] client connected fd=%d", cli);
         int old = g_client_fd.exchange(cli);
         if (old >= 0) close(old);
     }
@@ -233,9 +286,9 @@ static void server_thread() {
 
 // Scanner thread: every 500 ms, scan + send if client connected
 static void scan_thread() {
-    LOGI("[esp v11] scan thread, tid=%d", gettid());
+    LOGI("[esp v21] scan thread, tid=%d", gettid());
     sleep(45);  // shorter warmup; ActorManager usually ready by 30s but be safe
-    LOGI("[esp v11] scan loop starting");
+    LOGI("[esp v21] scan loop starting");
 
     while (true) {
         usleep(150 * 1000);  // 150 ms period (~6.7 Hz)
@@ -248,7 +301,7 @@ static void scan_thread() {
         if (n == 0) continue;
 
         if (!send_snapshot(fd, actors)) {
-            LOGI("[esp v11] client disconnected, closing fd=%d", fd);
+            LOGI("[esp v21] client disconnected, closing fd=%d", fd);
             close(fd);
             g_client_fd.store(-1);
         }
@@ -256,7 +309,7 @@ static void scan_thread() {
 }
 
 void esp_start(const char *game_data_dir) {
-    LOGI("[esp v11] esp_start");
+    LOGI("[esp v21] esp_start");
     std::thread srv(server_thread);
     srv.detach();
     std::thread scn(scan_thread);
