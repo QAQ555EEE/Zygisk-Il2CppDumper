@@ -185,21 +185,72 @@ static int scan_actors(std::vector<EspActor> &out) {
         out.push_back(a);
     }
 
-    // ===== HeroActors scan (v21) =====
-    // ActorManager.HeroActors @ +0x18 = TinyValueList<PoolObjHandle<ActorConfig>>
-    // Plausibility-checked at every deref to avoid v17/v19-style crashes.
-    void *hero_tvl = *(void **)((char *)am + AM_HERO_ACTORS);
-    if (!is_plausible_ptr(hero_tvl)) return (int)out.size();
+    // ===== Hero scan via GamePlayerCenter (v22) =====
+    // HeroActors path (v21) gave correct position/ObjID but camp/cfg=0 鈥?the
+    // ActorConfig stored there doesn't have player metadata populated.
+    // Real hero camp lives on Player.playerCamp.
+    // GamePlayerCenter singleton @ Assets.Scripts.GameSystem
+    //   m_playerLinkerList @ +0x18 = DictionaryView<uint, Player>
+    // Player layout:
+    //   playerCamp @ +0x08 (COM_PLAYERCAMP, Int32)
+    //   campPos    @ +0x0c (Int32 - 0-4 inside team in 5v5)
+    //   PlayerId   @ +0x20
+    //   captainConfigID @ +0x180 (hero config id)
+    //   Captain    @ +0x198 (PoolObjHandle<ActorConfig> 16 bytes, T* at +0x1A0)
+    static Il2CppClass *cached_gpc_klass = nullptr;
+    static FieldInfo *cached_gpc_s_inst = nullptr;
+    static Il2CppClass *cached_gpc_dv_klass = nullptr;
+    static int cached_gpc_off_ctx = -1;
 
-    int hero_size = *(int *)((char *)hero_tvl + TVL_SIZE);
-    void *hero_arr = *(void **)((char *)hero_tvl + TVL_ITEMS);
-    if (!is_plausible_ptr(hero_arr) || hero_size <= 0 || hero_size > 64) {
+    if (!cached_gpc_klass) {
+        cached_gpc_klass = find_class_anywhere("Assets.Scripts.GameSystem", "GamePlayerCenter");
+        if (!cached_gpc_klass) return (int)out.size();
+        Il2CppClass *parent = il2cpp_class_get_parent(cached_gpc_klass);
+        cached_gpc_s_inst = il2cpp_class_get_field_from_name(parent, "s_instance");
+        if (!cached_gpc_s_inst) cached_gpc_s_inst = il2cpp_class_get_field_from_name(cached_gpc_klass, "s_instance");
+        if (!cached_gpc_s_inst) return (int)out.size();
+    }
+
+    void *gpc = nullptr;
+    il2cpp_field_static_get_value(cached_gpc_s_inst, &gpc);
+    if (!is_plausible_ptr(gpc)) return (int)out.size();
+
+    void *p_dictview = *(void **)((char *)gpc + 0x18);  // m_playerLinkerList
+    if (!is_plausible_ptr(p_dictview)) return (int)out.size();
+
+    if (!cached_gpc_dv_klass) {
+        cached_gpc_dv_klass = il2cpp_object_get_class((Il2CppObject *)p_dictview);
+        if (!cached_gpc_dv_klass) return (int)out.size();
+        FieldInfo *f_ctx = il2cpp_class_get_field_from_name(cached_gpc_dv_klass, "Context");
+        int raw = f_ctx ? il2cpp_field_get_offset(f_ctx) : 0;
+        cached_gpc_off_ctx = raw >= 0x10 ? raw : (raw + 0x10);
+    }
+
+    void *p_dict = *(void **)((char *)p_dictview + cached_gpc_off_ctx);
+    if (!is_plausible_ptr(p_dict)) return (int)out.size();
+
+    int p_count = *(int *)((char *)p_dict + 0x18);
+    void *p_entries = *(void **)((char *)p_dict + 0x10);
+    if (!is_plausible_ptr(p_entries) || p_count <= 0 || p_count > 32) {
         return (int)out.size();
     }
 
-    for (int i = 0; i < hero_size; ++i) {
-        char *elem = (char *)hero_arr + ARRAY_ELEMENTS + i * POOLHANDLE_STRIDE;
-        void *hac = *(void **)(elem + POOLHANDLE_T_PTR);  // ActorConfig*
+    for (int i = 0; i < p_count + 4 && i < 32; ++i) {
+        char *pe = (char *)p_entries + 0x18 + i * 24;
+        int p_hash = *(int *)(pe + 0);
+        int p_next = *(int *)(pe + 4);
+        uint32_t p_key = *(uint32_t *)(pe + 8);
+        void *player = *(void **)(pe + 16);
+        if (p_hash < 0 && p_next < 0) continue;
+        if (!is_plausible_ptr(player)) continue;
+
+        int p_camp = *(int *)((char *)player + 0x8);   // playerCamp
+        int p_pos  = *(int *)((char *)player + 0xc);   // campPos
+        uint32_t p_cfg = *(uint32_t *)((char *)player + 0x180);  // captainConfigID
+
+        // Captain is PoolObjHandle<ActorConfig> @ Player+0x198, T* at +8
+        char *cap_handle = (char *)player + 0x198;
+        void *hac = *(void **)(cap_handle + POOLHANDLE_T_PTR);
         if (!is_plausible_ptr(hac)) continue;
 
         void *hinner = *(void **)((char *)hac + AC_INNER);
@@ -208,11 +259,11 @@ static int scan_actors(std::vector<EspActor> &out) {
         if (!is_plausible_ptr(hal)) continue;
 
         EspActor a;
-        a.key         = (uint32_t)i;   // index in HeroActors as pseudo-key
-        a.type        = *(int *)((char *)hac + AC_ACTORTYPE);     // expected 0 (HERO)
-        a.configId    = *(int *)((char *)hac + AC_CONFIGID);
-        a.camp        = *(int *)((char *)hac + AC_CMPTYPE);
-        a.battleOrder = *(int *)((char *)hac + AC_BATTLEORDER);
+        a.key         = p_key;  // playerId
+        a.type        = 0;       // HERO marker (overlay filters type==0)
+        a.configId    = (int)p_cfg;
+        a.camp        = p_camp;  // REAL camp from Player
+        a.battleOrder = p_pos;
         a.objId       = *(uint32_t *)((char *)hal + AL_OBJID);
         float *hp     = (float *)((char *)hal + AL_POSITION);
         a.x = hp[0]; a.y = hp[1]; a.z = hp[2];
@@ -246,9 +297,9 @@ static bool send_snapshot(int fd, const std::vector<EspActor> &actors) {
 
 // Server thread: bind TCP loopback, accept one client at a time, hand fd to global
 static void server_thread() {
-    LOGI("[esp v21] server thread, tid=%d", gettid());
+    LOGI("[esp v22] server thread, tid=%d", gettid());
     int srv = socket(AF_INET, SOCK_STREAM, 0);
-    if (srv < 0) { LOGE("[esp v21] socket() errno=%d", errno); return; }
+    if (srv < 0) { LOGE("[esp v22] socket() errno=%d", errno); return; }
 
     int yes = 1;
     setsockopt(srv, SOL_SOCKET, SO_REUSEADDR, &yes, sizeof(yes));
@@ -259,26 +310,26 @@ static void server_thread() {
     addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
 
     if (bind(srv, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
-        LOGE("[esp v21] bind 127.0.0.1:%d errno=%d", SOCK_PORT, errno);
+        LOGE("[esp v22] bind 127.0.0.1:%d errno=%d", SOCK_PORT, errno);
         close(srv);
         return;
     }
     if (listen(srv, 4) < 0) {
-        LOGE("[esp v21] listen errno=%d", errno);
+        LOGE("[esp v22] listen errno=%d", errno);
         close(srv);
         return;
     }
-    LOGI("[esp v21] listening on 127.0.0.1:%d", SOCK_PORT);
+    LOGI("[esp v22] listening on 127.0.0.1:%d", SOCK_PORT);
 
     while (true) {
         int cli = accept(srv, nullptr, nullptr);
         if (cli < 0) {
             if (errno == EINTR) continue;
-            LOGE("[esp v21] accept errno=%d", errno);
+            LOGE("[esp v22] accept errno=%d", errno);
             sleep(1);
             continue;
         }
-        LOGI("[esp v21] client connected fd=%d", cli);
+        LOGI("[esp v22] client connected fd=%d", cli);
         int old = g_client_fd.exchange(cli);
         if (old >= 0) close(old);
     }
@@ -286,9 +337,9 @@ static void server_thread() {
 
 // Scanner thread: every 500 ms, scan + send if client connected
 static void scan_thread() {
-    LOGI("[esp v21] scan thread, tid=%d", gettid());
+    LOGI("[esp v22] scan thread, tid=%d", gettid());
     sleep(45);  // shorter warmup; ActorManager usually ready by 30s but be safe
-    LOGI("[esp v21] scan loop starting");
+    LOGI("[esp v22] scan loop starting");
 
     while (true) {
         usleep(150 * 1000);  // 150 ms period (~6.7 Hz)
@@ -301,7 +352,7 @@ static void scan_thread() {
         if (n == 0) continue;
 
         if (!send_snapshot(fd, actors)) {
-            LOGI("[esp v21] client disconnected, closing fd=%d", fd);
+            LOGI("[esp v22] client disconnected, closing fd=%d", fd);
             close(fd);
             g_client_fd.store(-1);
         }
@@ -309,7 +360,7 @@ static void scan_thread() {
 }
 
 void esp_start(const char *game_data_dir) {
-    LOGI("[esp v21] esp_start");
+    LOGI("[esp v22] esp_start");
     std::thread srv(server_thread);
     srv.detach();
     std::thread scn(scan_thread);
