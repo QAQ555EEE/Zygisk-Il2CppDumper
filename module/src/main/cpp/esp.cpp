@@ -215,30 +215,33 @@ static int scan_heroes(std::vector<EspActor> &out) {
 
     int32_t  hp_camp = *(int32_t  *)((char *)hostPlayer + 0x008);
     uint32_t hp_cfg  = *(uint32_t *)((char *)hostPlayer + 0x180);
-    void *ac    = *(void **)((char *)hostPlayer + 0x198 + 8);
-    if (!is_plausible_ptr(ac))    { status_log(4, "captain ActorConfig NULL"); return 0; }
-    void *inner = *(void **)((char *)ac + 0x50);
-    if (!is_plausible_ptr(inner)) { status_log(5, "ActorConfigInner NULL"); return 0; }
-    void *al    = *(void **)((char *)inner + 0x08);
-    if (!is_plausible_ptr(al))    { status_log(6, "ActorLinker NULL"); return 0; }
+
+    // v30: bypass Captain chain (inner@+0x50 stays NULL on host's ActorConfig).
+    // Read Player.captainLogicPos @ +0x408 (VInt3, 3*int32 *1000 scaled) directly.
+    // captainLogicForward @ +0x414.  If updated each frame this is much simpler.
+    int32_t *vp = (int32_t *)((char *)hostPlayer + 0x408);
+    int32_t *vf = (int32_t *)((char *)hostPlayer + 0x414);
+    int32_t px = vp[0], py = vp[1], pz = vp[2];
+    int32_t fx = vf[0], fy = vf[1], fz = vf[2];
 
     if (last_status != 7) {
-        LOGI("[esp v29] chain OK host=%p camp=%d cfg=%u ac=%p inner=%p linker=%p",
-             hostPlayer, hp_camp, hp_cfg, ac, inner, al);
+        LOGI("[esp v30] chain OK via captainLogicPos host=%p camp=%d cfg=%u pos=(%d,%d,%d)/1000 fwd=(%d,%d,%d)",
+             hostPlayer, hp_camp, hp_cfg, px, py, pz, fx, fy, fz);
         last_status = 7;
     }
 
     EspActor a{};
-    a.key         = 0;             // host = self
-    a.type        = 0;             // HERO
+    a.key         = 0;
+    a.type        = 0;
     a.configId    = (int32_t)hp_cfg;
     a.camp        = hp_camp;
     a.battleOrder = 0;
-    a.objId       = *(uint32_t *)((char *)al + 0x4AC);
-    float *p      = (float *)((char *)al + 0x4C4);
-    a.x = p[0]; a.y = p[1]; a.z = p[2];
-    int32_t *f    = (int32_t *)((char *)al + 0x4B8);
-    a.fwd_x = f[0]; a.fwd_y = f[1]; a.fwd_z = f[2];
+    a.objId       = 0;  // VInt3 path has no ObjID; not needed for overlay
+    // VInt3 is *1000 scaled, convert to Unity world units (meters).
+    a.x = (float)px / 1000.0f;
+    a.y = (float)py / 1000.0f;
+    a.z = (float)pz / 1000.0f;
+    a.fwd_x = fx; a.fwd_y = fy; a.fwd_z = fz;
     out.push_back(a);
     return 1;
 }
