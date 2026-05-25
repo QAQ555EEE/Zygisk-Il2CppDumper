@@ -35,9 +35,9 @@
 #undef DO_API
 
 // ===== layout offsets (verified by v10) =====
-// AM+0x8 = actorList (Dict, all actors including HERO);
-// AM+0x10 = updatableActorList (Dict, only updatable ORGAN/MONSTER/SOLDIER - no HERO)
-#define AM_UPDATABLE_LIST   0x8
+// AM+0x10 = updatableActorList (Dict<uint, ActorConfig*>) - safe to walk
+// AM+0x8 actorList stores different value type and crashes on cast
+#define AM_UPDATABLE_LIST   0x10
 #define AC_ACTORTYPE        0x18
 #define AC_CONFIGID         0x1c
 #define AC_CMPTYPE          0x20
