@@ -158,46 +158,69 @@ static bool emit_player(void *player, uint32_t key, std::vector<EspActor> &out) 
 }
 
 // Returns number of heroes emitted (0 if GPC not ready / match not started).
+//
+// Edge-triggered diagnostic LOG: each failure stage logs only the first time
+// it's reached (so 0-spam during normal operation) and again any time the
+// failing stage changes. Lets us read logcat once and see where we got stuck.
 static int scan_heroes(std::vector<EspActor> &out) {
     out.clear();
 
     static Il2CppClass *cached_klass = nullptr;
     static FieldInfo *cached_s_inst = nullptr;
     static int       cached_dv_ctx  = -1;
-    static bool init_failed = false;
-    if (init_failed) return 0;
+    static int       last_stage = -1;   // 0=no_klass 1=no_s_inst 2=no_gpc 3=no_dictview 4=no_dict 5=bad_count 6=ok
+    auto log_stage = [](int s, const char *msg, int extra = 0) {
+        if (s == last_stage) return;
+        last_stage = s;
+        if (extra) LOGI("[esp v24] stage=%d %s extra=%d", s, msg, extra);
+        else       LOGI("[esp v24] stage=%d %s", s, msg);
+    };
 
     if (!cached_klass) {
         cached_klass = find_class_anywhere("Assets.Scripts.GameSystem", "GamePlayerCenter");
-        if (!cached_klass) { init_failed = true; return 0; }
+        if (!cached_klass) { log_stage(0, "GamePlayerCenter klass NOT_FOUND"); return 0; }
+        LOGI("[esp v24] GamePlayerCenter klass=%p", cached_klass);
         Il2CppClass *parent = il2cpp_class_get_parent(cached_klass);
         cached_s_inst = il2cpp_class_get_field_from_name(parent, "s_instance");
         if (!cached_s_inst)
             cached_s_inst = il2cpp_class_get_field_from_name(cached_klass, "s_instance");
-        if (!cached_s_inst) { init_failed = true; return 0; }
+        if (!cached_s_inst) { log_stage(1, "s_instance field NOT_FOUND"); return 0; }
+        LOGI("[esp v24] s_instance FieldInfo=%p", cached_s_inst);
     }
 
     void *gpc = nullptr;
     il2cpp_field_static_get_value(cached_s_inst, &gpc);
-    if (!is_plausible_ptr(gpc)) return 0;
+    if (!is_plausible_ptr(gpc)) { log_stage(2, "gpc s_instance NULL/garbage"); return 0; }
 
     void *dictview = *(void **)((char *)gpc + GPC_PLAYER_LIST);
-    if (!is_plausible_ptr(dictview)) return 0;
+    if (!is_plausible_ptr(dictview)) {
+        log_stage(3, "m_playerLinkerList NULL");
+        LOGI("[esp v24] gpc=%p dictview_raw=%p", gpc, dictview);
+        return 0;
+    }
 
     if (cached_dv_ctx < 0) {
         Il2CppClass *dv_klass = il2cpp_object_get_class((Il2CppObject *)dictview);
         FieldInfo *f_ctx = dv_klass ? il2cpp_class_get_field_from_name(dv_klass, "Context") : nullptr;
         int raw = f_ctx ? il2cpp_field_get_offset(f_ctx) : 0x8;
         cached_dv_ctx = raw >= 0x10 ? raw : (raw + 0x10);
-        LOGI("[esp v23] DictionaryView.Context @ +0x%x", cached_dv_ctx);
+        LOGI("[esp v24] DictionaryView.Context @ +0x%x (raw=0x%x)", cached_dv_ctx, raw);
     }
 
     void *dict = *(void **)((char *)dictview + cached_dv_ctx);
-    if (!is_plausible_ptr(dict)) return 0;
+    if (!is_plausible_ptr(dict)) { log_stage(4, "Context dict NULL"); return 0; }
 
     int   count   = *(int   *)((char *)dict + DICT_COUNT);
     void *entries = *(void **)((char *)dict + DICT_ENTRIES);
-    if (!is_plausible_ptr(entries) || count <= 0 || count > 32) return 0;
+    if (!is_plausible_ptr(entries) || count <= 0 || count > 32) {
+        log_stage(5, "dict empty or insane", count);
+        return 0;
+    }
+    if (last_stage != 6) {
+        LOGI("[esp v24] OK gpc=%p dictview=%p dict=%p count=%d entries=%p",
+             gpc, dictview, dict, count, entries);
+        last_stage = 6;
+    }
 
     // Walk up to count+free slots, scan generously since dictionary may be
     // sparse after a player disconnect.
@@ -235,9 +258,9 @@ static bool send_snapshot(int fd, const std::vector<EspActor> &actors) {
 }
 
 static void server_thread() {
-    LOGI("[esp v23] server thread, tid=%d", gettid());
+    LOGI("[esp v24] server thread, tid=%d", gettid());
     int srv = socket(AF_INET, SOCK_STREAM, 0);
-    if (srv < 0) { LOGE("[esp v23] socket() errno=%d", errno); return; }
+    if (srv < 0) { LOGE("[esp v24] socket() errno=%d", errno); return; }
 
     int yes = 1;
     setsockopt(srv, SOL_SOCKET, SO_REUSEADDR, &yes, sizeof(yes));
@@ -248,35 +271,35 @@ static void server_thread() {
     addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
 
     if (bind(srv, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
-        LOGE("[esp v23] bind 127.0.0.1:%d errno=%d", SOCK_PORT, errno);
+        LOGE("[esp v24] bind 127.0.0.1:%d errno=%d", SOCK_PORT, errno);
         close(srv);
         return;
     }
     if (listen(srv, 4) < 0) {
-        LOGE("[esp v23] listen errno=%d", errno);
+        LOGE("[esp v24] listen errno=%d", errno);
         close(srv);
         return;
     }
-    LOGI("[esp v23] listening on 127.0.0.1:%d", SOCK_PORT);
+    LOGI("[esp v24] listening on 127.0.0.1:%d", SOCK_PORT);
 
     while (true) {
         int cli = accept(srv, nullptr, nullptr);
         if (cli < 0) {
             if (errno == EINTR) continue;
-            LOGE("[esp v23] accept errno=%d", errno);
+            LOGE("[esp v24] accept errno=%d", errno);
             sleep(1);
             continue;
         }
-        LOGI("[esp v23] client connected fd=%d", cli);
+        LOGI("[esp v24] client connected fd=%d", cli);
         int old = g_client_fd.exchange(cli);
         if (old >= 0) close(old);
     }
 }
 
 static void scan_thread() {
-    LOGI("[esp v23] scan thread, tid=%d", gettid());
-    sleep(45);  // wait for ActorManager / GamePlayerCenter to populate (loading screen + spawn)
-    LOGI("[esp v23] scan loop starting");
+    LOGI("[esp v24] scan thread, tid=%d", gettid());
+    sleep(20);  // shorter warmup; loop probes GPC and logs stage on each transition
+    LOGI("[esp v24] scan loop starting");
 
     int empty_streak = 0;
     while (true) {
@@ -291,11 +314,11 @@ static void scan_thread() {
         // Diagnostic: log heartbeat every ~3s while client is up.
         if (++empty_streak >= 20) {
             empty_streak = 0;
-            LOGI("[esp v23] tick n=%d", n);
+            LOGI("[esp v24] tick n=%d", n);
         }
 
         if (!send_snapshot(fd, actors)) {
-            LOGI("[esp v23] client disconnected, closing fd=%d", fd);
+            LOGI("[esp v24] client disconnected, closing fd=%d", fd);
             close(fd);
             g_client_fd.store(-1);
         }
@@ -303,7 +326,7 @@ static void scan_thread() {
 }
 
 void esp_start(const char *game_data_dir) {
-    LOGI("[esp v23] esp_start");
+    LOGI("[esp v24] esp_start");
     std::thread srv(server_thread);
     srv.detach();
     std::thread scn(scan_thread);
