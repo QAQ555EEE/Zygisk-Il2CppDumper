@@ -484,32 +484,42 @@ static int scan_heroes(std::vector<EspActor> &out) {
                         float *p = (float *)((char *)al + 0x4C4);  // fallback
                         if (g_disp_buf && g_disp_count) {
                             uint32_t want = a.objId;
-                            // DisplayInfoData native layout (Pack=4, C struct):
-                            //   +0x00 actorID (u32)
-                            //   +0x04 forward (3 * i32 = 12)
-                            //   +0x10 position (3 * f32 = 12)
-                            //   +0x1c groundY (i32)
-                            //   +0x20 rotation (4 * f32 = 16)
-                            //   +0x30 parentObjID (u32)
-                            // total = 0x38? but C struct alignment may pad to 0x40
-                            const size_t STRIDES[] = { 0x38, 0x40, 0x30, 0x48 };
-                            for (size_t s = 0; s < sizeof(STRIDES)/sizeof(STRIDES[0]); ++s) {
-                                size_t stride = STRIDES[s];
-                                bool found = false;
-                                for (uint32_t i = 0; i < g_disp_count && i < 256; ++i) {
-                                    const char *e = (const char *)g_disp_buf + i * stride;
-                                    uint32_t aid = *(const uint32_t *)e;
-                                    if (aid == 0) break;  // v38 sentinel: end-of-array
-                                    if (aid == want) {
-                                        // Try +0x10 (managed-style layout) and +0x18 (declared offset)
-                                        float *cand = (float *)(e + 0x10);
-                                        if (cand[0] > -200.0f && cand[0] < 200.0f) {
-                                            p = cand; found = true;
+                            // v39: SGW.GetDisplayData() returns a managed wrapper.
+                            // Try multiple (base_off, stride) hypotheses for where
+                            // the actual DisplayInfoData entries live within buf.
+                            //   base=0x10: short managed header (klass+monitor)
+                            //   base=0x18: array with inline length at +0x10
+                            //   base=0x20: full managed array (klass+monitor+bounds+length)
+                            //   base=0x28: alternate sgame wrapper
+                            // strides cover DisplayInfoData declared field range (0x38..0x48)
+                            const size_t BASES[]   = { 0x10, 0x18, 0x20, 0x28, 0x30 };
+                            const size_t STRIDES[] = { 0x30, 0x38, 0x40, 0x48, 0x50 };
+                            bool found = false;
+                            for (size_t bi = 0; bi < sizeof(BASES)/sizeof(BASES[0]) && !found; ++bi) {
+                                const char *base = (const char *)g_disp_buf + BASES[bi];
+                                for (size_t si = 0; si < sizeof(STRIDES)/sizeof(STRIDES[0]) && !found; ++si) {
+                                    size_t stride = STRIDES[si];
+                                    for (uint32_t i = 0; i < 64; ++i) {
+                                        const char *e = base + i * stride;
+                                        uint32_t aid = *(const uint32_t *)e;
+                                        if (aid == want) {
+                                            // Try +0x10 (managed-style layout) for position
+                                            float *cand = (float *)(e + 0x10);
+                                            if (cand[0] > -200.0f && cand[0] < 200.0f &&
+                                                cand[2] > -200.0f && cand[2] < 200.0f) {
+                                                p = cand; found = true;
+                                                // Log first successful hit for sanity
+                                                static bool logged = false;
+                                                if (!logged) {
+                                                    LOGI("[esp v39] HIT base=+0x%zx stride=0x%zx i=%u actorID=%u pos=(%.1f,%.1f,%.1f)",
+                                                         BASES[bi], stride, i, want, cand[0], cand[1], cand[2]);
+                                                    logged = true;
+                                                }
+                                            }
+                                            break;
                                         }
-                                        break;
                                     }
                                 }
-                                if (found) break;
                             }
                         }
                         a.x = p[0]; a.y = p[1]; a.z = p[2];
