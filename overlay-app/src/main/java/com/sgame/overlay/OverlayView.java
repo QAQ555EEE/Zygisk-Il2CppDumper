@@ -53,48 +53,45 @@ public class OverlayView extends View {
 
         float scale = (mapSize / 2) / WORLD_HALF;
 
-        int heroCount = 0;
+        // Only draw ENEMY heroes (camp=2, type=2). Game already shows own team on its minimap.
         int enemyHero = 0;
-        // Pass 1: towers/spring (background)
+        int rawType2Camp2 = 0;
+        StringBuilder dbg = new StringBuilder();
         for (OverlayService.Actor a : actors) {
-            if (a.camp != 1 && a.camp != 2) continue;
+            if (a.type != 2 || a.camp != 2) continue;
+            rawType2Camp2++;
+            // Heuristic: real heroes have battleOrder 0..9 (5v5).
+            // Summons / pets / clones get higher battleOrder.
+            if (a.battleOrder < 0 || a.battleOrder > 9) continue;
             float dx = cx + a.x * scale;
             float dy = cy - a.z * scale;
-            if (dx < left || dx > left + mapSize || dy < top || dy > top + mapSize) continue;
-            if (a.type == 1) { // tower
-                dotPaint.setColor(a.camp == 1 ? Color.argb(220, 80, 180, 255)
-                                              : Color.argb(220, 255, 100, 100));
-                c.drawRect(dx-6, dy-6, dx+6, dy+6, dotPaint);
-            } else if (a.type == 5) { // spring/crystal
-                dotPaint.setColor(a.camp == 1 ? Color.argb(220, 0, 200, 255)
-                                              : Color.argb(220, 255, 60, 60));
-                c.drawRect(dx-9, dy-9, dx+9, dy+9, dotPaint);
-            }
-        }
-        // Pass 2: heroes (foreground, big circles with halo)
-        for (OverlayService.Actor a : actors) {
-            if (a.type != 2 || (a.camp != 1 && a.camp != 2)) continue;
-            heroCount++;
-            float dx = cx + a.x * scale;
-            float dy = cy - a.z * scale;
-            if (dx < left || dx > left + mapSize || dy < top || dy > top + mapSize) continue;
-            int main, halo;
-            if (a.camp == 1) {
-                main = Color.argb(255, 80, 180, 255);
-                halo = Color.argb(80, 80, 180, 255);
-            } else {
-                main = Color.argb(255, 255, 70, 70);
-                halo = Color.argb(100, 255, 70, 70);
-                enemyHero++;
-            }
+            // Clamp to map edge (don't drop off-map - draw at boundary so user sees direction)
+            float clampedX = Math.max(left + 16, Math.min(left + mapSize - 16, dx));
+            float clampedY = Math.max(top + 16, Math.min(top + mapSize - 16, dy));
+            boolean offMap = (clampedX != dx || clampedY != dy);
+
+            enemyHero++;
+            int main = Color.argb(255, 255, 70, 70);
+            int halo = Color.argb(offMap ? 60 : 120, 255, 70, 70);
             dotPaint.setColor(halo);
-            c.drawCircle(dx, dy, 22f, dotPaint);
+            c.drawCircle(clampedX, clampedY, 30f, dotPaint);
             dotPaint.setColor(main);
-            c.drawCircle(dx, dy, 12f, dotPaint);
+            c.drawCircle(clampedX, clampedY, 16f, dotPaint);
+            // Label: battleOrder index
+            textPaint.setColor(Color.WHITE);
+            c.drawText(String.valueOf(a.battleOrder), clampedX - 8, clampedY + 9, textPaint);
+            if (dbg.length() < 240) {
+                dbg.append("b").append(a.battleOrder)
+                   .append(" cfg=").append(a.configId)
+                   .append(" (").append((int)a.x).append(",").append((int)a.z).append(") ");
+            }
         }
 
-        c.drawText("heroes=" + heroCount + "  enemy=" + enemyHero
+        c.drawText("enemy=" + enemyHero + " raw=" + rawType2Camp2
                    + "  /" + actors.length,
                    left + 8, top + 30, textPaint);
+        if (dbg.length() > 0) {
+            android.util.Log.i("sgame_overlay", "enemies: " + dbg);
+        }
     }
 }
