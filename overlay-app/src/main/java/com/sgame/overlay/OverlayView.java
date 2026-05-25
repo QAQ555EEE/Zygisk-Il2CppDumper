@@ -54,13 +54,13 @@ public class OverlayView extends View {
 
         float scale = (mapSize / 2) / WORLD_HALF;
 
-        // Draw ALL enemy type=2 camp=2 actors with battleOrder + configId label so user
-        // can identify which moves (= hero) vs which is stationary (= base/crystal/pet).
-        int rawType2Camp2 = 0;
+        // ActorTypeDef in sgame: 0=HERO, 1=MONSTER, 2=ORGAN(tower/crystal),
+        // 4=CALL(summon), 5=BULLET, 10=PET. We want HERO=0 only.
+        int rawHero = 0;
         StringBuilder dbg = new StringBuilder();
         for (OverlayService.Actor a : actors) {
-            if (a.type != 2 || a.camp != 2) continue;
-            rawType2Camp2++;
+            if (a.type != 0 || a.camp != 2) continue;
+            rawHero++;
             float dx = cx + a.x * scale;
             float dy = cy - a.z * scale;
             float clampedX = Math.max(left + 14, Math.min(left + mapSize - 14, dx));
@@ -81,7 +81,7 @@ public class OverlayView extends View {
             textPaint.setTextSize(28);
         }
 
-        c.drawText("enemy raw=" + rawType2Camp2 + "  /" + actors.length,
+        c.drawText("enemy hero=" + rawHero + "  /" + actors.length,
                    left + 8, top + 30, textPaint);
 
         // Dump every ~1.5s (10th call at 150ms tick).
@@ -89,7 +89,7 @@ public class OverlayView extends View {
         if (dumpCounter >= 10) {
             dumpCounter = 0;
             for (OverlayService.Actor a : actors) {
-                if (a.type != 2 || a.camp != 2) continue;
+                if (a.type != 0 || a.camp != 2) continue;
                 if (dbg.length() < 800) {
                     dbg.append("b").append(a.battleOrder)
                        .append(" cfg=").append(a.configId)
