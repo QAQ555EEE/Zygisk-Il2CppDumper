@@ -210,40 +210,122 @@ static int scan_heroes(std::vector<EspActor> &out) {
     // Each chain step now logs once on first success so we can verify the
     // Captain handle / inner / linker / position chain works end-to-end
     // before going wider.
-    void *hostPlayer = *(void **)((char *)gpc + 0x48);
-    if (!is_plausible_ptr(hostPlayer)) { status_log(3, "hostPlayer NULL (not in match)"); return 0; }
-
-    int32_t  hp_camp = *(int32_t  *)((char *)hostPlayer + 0x008);
-    uint32_t hp_cfg  = *(uint32_t *)((char *)hostPlayer + 0x180);
-
-    // v30: bypass Captain chain (inner@+0x50 stays NULL on host's ActorConfig).
-    // Read Player.captainLogicPos @ +0x408 (VInt3, 3*int32 *1000 scaled) directly.
-    // captainLogicForward @ +0x414.  If updated each frame this is much simpler.
-    int32_t *vp = (int32_t *)((char *)hostPlayer + 0x408);
-    int32_t *vf = (int32_t *)((char *)hostPlayer + 0x414);
-    int32_t px = vp[0], py = vp[1], pz = vp[2];
-    int32_t fx = vf[0], fy = vf[1], fz = vf[2];
-
-    if (last_status != 7) {
-        LOGI("[esp v30] chain OK via captainLogicPos host=%p camp=%d cfg=%u pos=(%d,%d,%d)/1000 fwd=(%d,%d,%d)",
-             hostPlayer, hp_camp, hp_cfg, px, py, pz, fx, fy, fz);
-        last_status = 7;
+    // === v31 listview hex probe ===
+    // Dump first 0x40 bytes of cacheList @ gpc+0x50 once, to determine if it's
+    // a real IL2CPP object (klass ptr in b400... range + valid List in Context).
+    static bool lv_dumped = false;
+    if (!lv_dumped) {
+        void *lv50 = *(void **)((char *)gpc + 0x50);
+        void *lv30 = *(void **)((char *)gpc + 0x30);
+        if (is_plausible_ptr(lv50)) {
+            const uint64_t *q = (const uint64_t *)lv50;
+            LOGI("[esp v31] cacheList@%p hex: %016llx %016llx %016llx %016llx %016llx %016llx %016llx %016llx",
+                 lv50, (unsigned long long)q[0], (unsigned long long)q[1],
+                 (unsigned long long)q[2], (unsigned long long)q[3],
+                 (unsigned long long)q[4], (unsigned long long)q[5],
+                 (unsigned long long)q[6], (unsigned long long)q[7]);
+            // If lv50.Context (+0x18) is a managed List, dump its head too.
+            void *list = *(void **)((char *)lv50 + 0x18);
+            if (is_plausible_ptr(list)) {
+                const uint64_t *l = (const uint64_t *)list;
+                LOGI("[esp v31] cacheList.Context@%p hex: %016llx %016llx %016llx %016llx %016llx %016llx",
+                     list, (unsigned long long)l[0], (unsigned long long)l[1],
+                     (unsigned long long)l[2], (unsigned long long)l[3],
+                     (unsigned long long)l[4], (unsigned long long)l[5]);
+            }
+        }
+        if (is_plausible_ptr(lv30)) {
+            const uint64_t *q = (const uint64_t *)lv30;
+            LOGI("[esp v31] tempList@%p hex: %016llx %016llx %016llx %016llx",
+                 lv30, (unsigned long long)q[0], (unsigned long long)q[1],
+                 (unsigned long long)q[2], (unsigned long long)q[3]);
+        }
+        lv_dumped = true;
     }
 
-    EspActor a{};
-    a.key         = 0;
-    a.type        = 0;
-    a.configId    = (int32_t)hp_cfg;
-    a.camp        = hp_camp;
-    a.battleOrder = 0;
-    a.objId       = 0;  // VInt3 path has no ObjID; not needed for overlay
-    // VInt3 is *1000 scaled, convert to Unity world units (meters).
-    a.x = (float)px / 1000.0f;
-    a.y = (float)py / 1000.0f;
-    a.z = (float)pz / 1000.0f;
-    a.fwd_x = fx; a.fwd_y = fy; a.fwd_z = fz;
-    out.push_back(a);
-    return 1;
+    // Helper: emit one Player as an EspActor by reading its captainLogicPos.
+    // Returns true on success. Always checks the Player ptr looks valid first.
+    auto emit_player_logicpos = [&](void *player, uint32_t key) -> bool {
+        if (!is_plausible_ptr(player)) return false;
+        int32_t  camp = *(int32_t  *)((char *)player + 0x008);
+        uint32_t cfg  = *(uint32_t *)((char *)player + 0x180);
+        // Reject obvious garbage: camp must be 0..15, cfg must be 0..0x100000.
+        if (camp < 0 || camp > 15) return false;
+        if (cfg > 0x100000) return false;
+        int32_t *vp = (int32_t *)((char *)player + 0x408);
+        int32_t *vf = (int32_t *)((char *)player + 0x414);
+        EspActor a{};
+        a.key   = key;
+        a.type  = 0;
+        a.configId = (int32_t)cfg;
+        a.camp     = camp;
+        a.objId    = 0;
+        a.x = (float)vp[0] / 1000.0f;
+        a.y = (float)vp[1] / 1000.0f;
+        a.z = (float)vp[2] / 1000.0f;
+        a.fwd_x = vf[0]; a.fwd_y = vf[1]; a.fwd_z = vf[2];
+        out.push_back(a);
+        return true;
+    };
+
+    // v31: walk playersCache ListView<Player>.  ListViewBase.Context offset is
+    // reflected, not hardcoded -- v28 hardcoded +0x18 and crashed sgame because
+    // ListViewBase isn't a generic, so IL2CPP reports the raw offset without
+    // the +0x10 header bump.  Each element is class-checked: if its klass ptr
+    // doesn't match Player's klass we skip rather than treat random heap as Player.
+    static Il2CppClass *cached_player_klass = nullptr;
+    static int          cached_lv_ctx_off   = -1;
+
+    // Always emit hostPlayer as a baseline (proven safe in v30).
+    void *hostPlayer = *(void **)((char *)gpc + 0x48);
+    if (!is_plausible_ptr(hostPlayer)) { status_log(3, "hostPlayer NULL"); return 0; }
+    emit_player_logicpos(hostPlayer, 0);
+    if (!cached_player_klass) cached_player_klass = il2cpp_object_get_class((Il2CppObject *)hostPlayer);
+
+    // Try to iterate playersCache (+0x50) for the rest of the players.
+    void *lv = *(void **)((char *)gpc + 0x50);
+    if (is_plausible_ptr(lv)) {
+        if (cached_lv_ctx_off < 0) {
+            Il2CppClass *lv_klass = il2cpp_object_get_class((Il2CppObject *)lv);
+            if (lv_klass) {
+                Il2CppClass *parent = il2cpp_class_get_parent(lv_klass);
+                FieldInfo *fctx = parent ? il2cpp_class_get_field_from_name(parent, "Context") : nullptr;
+                if (!fctx) fctx = il2cpp_class_get_field_from_name(lv_klass, "Context");
+                int raw = fctx ? il2cpp_field_get_offset(fctx) : -1;
+                if (raw >= 0) {
+                    cached_lv_ctx_off = raw >= 0x10 ? raw : (raw + 0x10);
+                    LOGI("[esp v31] ListView.Context @ +0x%x (raw=0x%x)", cached_lv_ctx_off, raw);
+                }
+            }
+        }
+        if (cached_lv_ctx_off > 0) {
+            void *list = *(void **)((char *)lv + cached_lv_ctx_off);
+            if (is_plausible_ptr(list)) {
+                void *items = *(void **)((char *)list + 0x10);
+                int   size  = *(int   *)((char *)list + 0x18);
+                if (is_plausible_ptr(items) && size > 0 && size <= 16) {
+                    int emitted_extra = 0;
+                    for (int i = 0; i < size; ++i) {
+                        void *p = *(void **)((char *)items + 0x18 + i * sizeof(void *));
+                        if (!is_plausible_ptr(p)) continue;
+                        if (p == hostPlayer) continue;
+                        // class check: reject if not the same klass as Player.
+                        if (cached_player_klass) {
+                            Il2CppClass *ek = il2cpp_object_get_class((Il2CppObject *)p);
+                            if (ek != cached_player_klass) continue;
+                        }
+                        if (emit_player_logicpos(p, (uint32_t)(i + 1))) emitted_extra++;
+                    }
+                    if (last_status != 7) {
+                        LOGI("[esp v31] playersCache size=%d extra_emitted=%d", size, emitted_extra);
+                        last_status = 7;
+                    }
+                }
+            }
+        }
+    }
+
+    return (int)out.size();
 }
 
 static bool send_snapshot(int fd, const std::vector<EspActor> &actors) {
