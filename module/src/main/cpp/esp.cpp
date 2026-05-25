@@ -387,6 +387,79 @@ static int scan_heroes(std::vector<EspActor> &out) {
     il2cpp_field_static_get_value(cached_s_inst, &gpc);
     if (!is_plausible_ptr(gpc)) { status_log(2, "gpc NULL"); return 0; }
 
+    // === v43 path C: CullingGroupMgr Unity Transform probe ===
+    // Brainstorm idea: Unity engine needs each GameObject's REAL world
+    // position to compute view-frustum culling, so Transform.position must
+    // be up-to-date for every actor regardless of game-side FOW filter.
+    // FOW only toggles MeshRenderer.enabled, leaving Transform untouched.
+    //
+    // Walk CullingGroupMgr.indexMap (Dictionary<int, CullingNode>) once,
+    // dump first 2 actors' CullingNode + Transform memory so we can RE the
+    // managed→native Transform layout in this sgame Unity build.
+    static bool culling_probed = false;
+    if (!culling_probed) {
+        culling_probed = true;
+        Il2CppClass *cg_klass = find_class_anywhere("Assets.Scripts.GameLogic", "CullingGroupMgr");
+        if (cg_klass) {
+            Il2CppClass *parent_c = il2cpp_class_get_parent(cg_klass);
+            FieldInfo *cg_sinst = il2cpp_class_get_field_from_name(parent_c, "s_instance");
+            if (!cg_sinst) cg_sinst = il2cpp_class_get_field_from_name(cg_klass, "s_instance");
+            void *cg = nullptr;
+            if (cg_sinst) il2cpp_field_static_get_value(cg_sinst, &cg);
+            if (is_plausible_ptr(cg)) {
+                LOGI("[esp v43] CullingGroupMgr inst=%p", cg);
+                void *idx_dict = *(void **)((char *)cg + 0x10);
+                LOGI("[esp v43] indexMap=%p isActive=%d", idx_dict, *(int *)((char *)cg + 0x08));
+                if (is_plausible_ptr(idx_dict)) {
+                    // Dump Dict head + first 4 entries assuming standard mscorlib
+                    // layout (count@+0x18, entries@+0x10, stride 24).
+                    int dcount = *(int *)((char *)idx_dict + 0x18);
+                    void *dents = *(void **)((char *)idx_dict + 0x10);
+                    LOGI("[esp v43] indexMap count=%d entries=%p", dcount, dents);
+                    if (is_plausible_ptr(dents) && dcount > 0 && dcount < 1024) {
+                        for (int i = 0; i < 4 && i < dcount; ++i) {
+                            char *e = (char *)dents + 0x18 + i * 24;
+                            int hashCode = *(int *)(e + 0);
+                            if (hashCode < 0) continue;
+                            int key = *(int *)(e + 8);
+                            void *node = *(void **)(e + 16);
+                            if (!is_plausible_ptr(node)) continue;
+                            // CullingNode.transform @ +0x28 (managed Unity Transform)
+                            void *xform_managed = *(void **)((char *)node + 0x28);
+                            // UnityEngine.Object.m_CachedPtr @ +0x10 in IL2CPP managed
+                            void *xform_native = is_plausible_ptr(xform_managed)
+                                ? *(void **)((char *)xform_managed + 0x10) : nullptr;
+                            const uint64_t *nq = (const uint64_t *)node;
+                            LOGI("[esp v43] node[%d] key=%d ptr=%p hex: %016llx %016llx %016llx %016llx %016llx %016llx %016llx %016llx",
+                                 i, key, node,
+                                 (unsigned long long)nq[0], (unsigned long long)nq[1],
+                                 (unsigned long long)nq[2], (unsigned long long)nq[3],
+                                 (unsigned long long)nq[4], (unsigned long long)nq[5],
+                                 (unsigned long long)nq[6], (unsigned long long)nq[7]);
+                            LOGI("[esp v43] node[%d] xform_managed=%p xform_native=%p",
+                                 i, xform_managed, xform_native);
+                            if (is_plausible_ptr(xform_native)) {
+                                const uint64_t *xq = (const uint64_t *)xform_native;
+                                LOGI("[esp v43] xform_native[%d] hex: %016llx %016llx %016llx %016llx %016llx %016llx %016llx %016llx %016llx %016llx %016llx %016llx",
+                                     i,
+                                     (unsigned long long)xq[0], (unsigned long long)xq[1],
+                                     (unsigned long long)xq[2], (unsigned long long)xq[3],
+                                     (unsigned long long)xq[4], (unsigned long long)xq[5],
+                                     (unsigned long long)xq[6], (unsigned long long)xq[7],
+                                     (unsigned long long)xq[8], (unsigned long long)xq[9],
+                                     (unsigned long long)xq[10], (unsigned long long)xq[11]);
+                            }
+                        }
+                    }
+                }
+            } else {
+                LOGI("[esp v43] CullingGroupMgr inst NULL");
+            }
+        } else {
+            LOGI("[esp v43] CullingGroupMgr klass NOT_FOUND");
+        }
+    }
+
     // v29: paranoid hostPlayer-only path.  v28 crashed sgame in the lobby --
     // probably emit_player chasing Captain->Inner->ActorLinker on an item
     // that wasn't actually a Player (ListView contents shape unknown), or
