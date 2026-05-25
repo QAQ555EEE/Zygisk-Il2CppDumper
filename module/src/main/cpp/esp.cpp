@@ -200,51 +200,47 @@ static int scan_heroes(std::vector<EspActor> &out) {
     il2cpp_field_static_get_value(cached_s_inst, &gpc);
     if (!is_plausible_ptr(gpc)) { status_log(2, "gpc NULL"); return 0; }
 
-    // Helper: iterate a ListView<Player> at gpc+offset, emit each Player.
-    auto try_listview = [&](int offset, const char *tag) -> int {
-        void *lv = *(void **)((char *)gpc + offset);
-        if (!is_plausible_ptr(lv)) return -1;
-        // ListViewBase.Context @ raw +0x8 -> runtime +0x18 (IL2CPP header 0x10).
-        void *list = *(void **)((char *)lv + 0x18);
-        if (!is_plausible_ptr(list)) return -2;
-        // mscorlib List<T>: _items @ +0x10, _size @ +0x18.
-        void *items = *(void **)((char *)list + 0x10);
-        int   size  = *(int   *)((char *)list + 0x18);
-        if (!is_plausible_ptr(items) || size <= 0 || size > 16) return size;
-        int emitted = 0;
-        // Il2CppArray on aarch64: klass +0, monitor +8, max_length +0x10, elements +0x18.
-        for (int i = 0; i < size && i < 16; ++i) {
-            void *player = *(void **)((char *)items + 0x18 + i * sizeof(void *));
-            if (emit_player(player, (uint32_t)i, out)) emitted++;
-        }
-        if (emitted > 0) {
-            int newstatus = (offset << 8) | 7;
-            if (newstatus != last_status) {
-                LOGI("[esp v28] OK via %s @+0x%x size=%d emitted=%d", tag, offset, size, emitted);
-                last_status = newstatus;
-            }
-        }
-        return emitted;
-    };
+    // v29: paranoid hostPlayer-only path.  v28 crashed sgame in the lobby --
+    // probably emit_player chasing Captain->Inner->ActorLinker on an item
+    // that wasn't actually a Player (ListView contents shape unknown), or
+    // the listview itself wasn't a managed object.  Skip listviews entirely
+    // and only emit the single host player.  Once we prove this stays stable
+    // and renders one dot, we'll add a class-validated listview path.
+    //
+    // Each chain step now logs once on first success so we can verify the
+    // Captain handle / inner / linker / position chain works end-to-end
+    // before going wider.
+    void *hostPlayer = *(void **)((char *)gpc + 0x48);
+    if (!is_plausible_ptr(hostPlayer)) { status_log(3, "hostPlayer NULL (not in match)"); return 0; }
 
-    int n = try_listview(0x50, "playersCache");
-    if (n <= 0) n = try_listview(0x30, "playersTempList");
+    int32_t  hp_camp = *(int32_t  *)((char *)hostPlayer + 0x008);
+    uint32_t hp_cfg  = *(uint32_t *)((char *)hostPlayer + 0x180);
+    void *ac    = *(void **)((char *)hostPlayer + 0x198 + 8);
+    if (!is_plausible_ptr(ac))    { status_log(4, "captain ActorConfig NULL"); return 0; }
+    void *inner = *(void **)((char *)ac + 0x50);
+    if (!is_plausible_ptr(inner)) { status_log(5, "ActorConfigInner NULL"); return 0; }
+    void *al    = *(void **)((char *)inner + 0x08);
+    if (!is_plausible_ptr(al))    { status_log(6, "ActorLinker NULL"); return 0; }
 
-    // hostPlayer fallback: even if both ListViews are empty, gpc+0x48 is the
-    // local player Player* once you've selected a hero. Emit it so the overlay
-    // shows your own dot during the loading screen / hero-pick period.
-    if (out.empty()) {
-        void *hostPlayer = *(void **)((char *)gpc + 0x48);
-        if (is_plausible_ptr(hostPlayer)) {
-            if (emit_player(hostPlayer, 0xFFFFFFFFu, out)) {
-                if (last_status != 8) {
-                    LOGI("[esp v28] fallback to hostPlayer @+0x48 (lists still empty)");
-                    last_status = 8;
-                }
-            }
-        }
+    if (last_status != 7) {
+        LOGI("[esp v29] chain OK host=%p camp=%d cfg=%u ac=%p inner=%p linker=%p",
+             hostPlayer, hp_camp, hp_cfg, ac, inner, al);
+        last_status = 7;
     }
-    return (int)out.size();
+
+    EspActor a{};
+    a.key         = 0;             // host = self
+    a.type        = 0;             // HERO
+    a.configId    = (int32_t)hp_cfg;
+    a.camp        = hp_camp;
+    a.battleOrder = 0;
+    a.objId       = *(uint32_t *)((char *)al + 0x4AC);
+    float *p      = (float *)((char *)al + 0x4C4);
+    a.x = p[0]; a.y = p[1]; a.z = p[2];
+    int32_t *f    = (int32_t *)((char *)al + 0x4B8);
+    a.fwd_x = f[0]; a.fwd_y = f[1]; a.fwd_z = f[2];
+    out.push_back(a);
+    return 1;
 }
 
 static bool send_snapshot(int fd, const std::vector<EspActor> &actors) {
