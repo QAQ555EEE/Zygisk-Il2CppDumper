@@ -210,9 +210,36 @@ static int scan_heroes(std::vector<EspActor> &out) {
     void *dict = *(void **)((char *)dictview + cached_dv_ctx);
     if (!is_plausible_ptr(dict)) { log_stage(4, "Context dict NULL"); return 0; }
 
+    // === v26 dict hexdump: log first 0x40 bytes once per state-change to find
+    // the right count/entries offsets if mscorlib layout differs in this build.
     int   count   = *(int   *)((char *)dict + DICT_COUNT);
     void *entries = *(void **)((char *)dict + DICT_ENTRIES);
     if (!is_plausible_ptr(entries) || count <= 0 || count > 32) {
+        if (last_stage != 5) {
+            const uint64_t *q = (const uint64_t *)dict;
+            LOGI("[esp v26] dict@%p hex: %016llx %016llx %016llx %016llx %016llx %016llx %016llx %016llx",
+                 dict,
+                 (unsigned long long)q[0], (unsigned long long)q[1],
+                 (unsigned long long)q[2], (unsigned long long)q[3],
+                 (unsigned long long)q[4], (unsigned long long)q[5],
+                 (unsigned long long)q[6], (unsigned long long)q[7]);
+            LOGI("[esp v26] count@+0x18=%d entries@+0x10=%p (parsed values)", count, entries);
+
+            // Probe GamePlayerCenter alt fields for fallback container candidates.
+            void *playersTempList = *(void **)((char *)gpc + 0x30);
+            void *hostPlayer      = *(void **)((char *)gpc + 0x48);
+            void *playersCache    = *(void **)((char *)gpc + 0x50);
+            uint32_t hostPlayerID = *(uint32_t *)((char *)gpc + 0x40);
+            LOGI("[esp v26] gpc[+0x30]=%p tempList; [+0x40]=%u hostPlayerID; [+0x48]=%p hostPlayer; [+0x50]=%p cacheList",
+                 playersTempList, hostPlayerID, hostPlayer, playersCache);
+            if (is_plausible_ptr(hostPlayer)) {
+                int32_t hp_camp = *(int32_t *)((char *)hostPlayer + 0x8);
+                uint32_t hp_cfg  = *(uint32_t *)((char *)hostPlayer + 0x180);
+                void *hp_captain = *(void **)((char *)hostPlayer + 0x198 + 8);
+                LOGI("[esp v26] hostPlayer camp@+0x8=%d cfg@+0x180=%u captainAC@+0x1A0=%p",
+                     hp_camp, hp_cfg, hp_captain);
+            }
+        }
         log_stage(5, "dict empty or insane", count);
         return 0;
     }
