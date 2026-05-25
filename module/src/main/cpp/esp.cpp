@@ -244,20 +244,56 @@ static void refresh_display_data() {
     //   items = *(x0 + 0x10)        <- list._items (T[] managed array)
     //   elements start at items + 0x18 (aarch64 sgame Il2CppArray layout)
     // We chase the same chain in pure memory reads.
+    static int chain_log_count = 0;
     void *state = *(void **)cached_global_addr;
-    if (!is_plausible_ptr(state)) { g_disp_buf = nullptr; g_disp_count = 0; return; }
+    if (!is_plausible_ptr(state)) {
+        if (chain_log_count < 3) {
+            LOGI("[esp v42] chain step 1 FAIL: state=%p (not plausible)", state);
+            chain_log_count++;
+        }
+        g_disp_buf = nullptr; g_disp_count = 0; return;
+    }
     void *inner = *(void **)((char *)state + 0xb8);
-    if (!is_plausible_ptr(inner)) { g_disp_buf = nullptr; g_disp_count = 0; return; }
+    if (!is_plausible_ptr(inner)) {
+        if (chain_log_count < 3) {
+            LOGI("[esp v42] chain step 2 FAIL: state=%p inner@+0xb8=%p", state, inner);
+            chain_log_count++;
+        }
+        g_disp_buf = nullptr; g_disp_count = 0; return;
+    }
     void *list = *(void **)((char *)inner + 0x58);
-    if (!is_plausible_ptr(list)) { g_disp_buf = nullptr; g_disp_count = 0; return; }
+    if (!is_plausible_ptr(list)) {
+        if (chain_log_count < 3) {
+            LOGI("[esp v42] chain step 3 FAIL: state=%p inner=%p list@+0x58=%p", state, inner, list);
+            chain_log_count++;
+        }
+        g_disp_buf = nullptr; g_disp_count = 0; return;
+    }
     void *items = *(void **)((char *)list + 0x10);
     int   size  = *(int   *)((char *)list + 0x18);
     if (!is_plausible_ptr(items) || size <= 0 || size > 256) {
+        if (chain_log_count < 3) {
+            LOGI("[esp v42] chain step 4 FAIL: state=%p inner=%p list=%p items=%p size=%d",
+                 state, inner, list, items, size);
+            // hex dump list head 64 bytes
+            const uint64_t *q = (const uint64_t *)list;
+            LOGI("[esp v42] list hex: %016llx %016llx %016llx %016llx %016llx %016llx %016llx %016llx",
+                 (unsigned long long)q[0], (unsigned long long)q[1],
+                 (unsigned long long)q[2], (unsigned long long)q[3],
+                 (unsigned long long)q[4], (unsigned long long)q[5],
+                 (unsigned long long)q[6], (unsigned long long)q[7]);
+            chain_log_count++;
+        }
         g_disp_buf = nullptr; g_disp_count = 0; return;
     }
     // Skip Il2CppArray header to land on element[0].
     g_disp_buf   = (char *)items + 0x18;
     g_disp_count = (uint32_t)size;
+    if (chain_log_count < 3) {
+        LOGI("[esp v42] chain OK: state=%p inner=%p list=%p size=%d items=%p entries=%p",
+             state, inner, list, size, items, g_disp_buf);
+        chain_log_count++;
+    }
 
     // Apply same trick to GetDisplayData_Count -- but optimistically:
     // its native fn likely loads count from a global at the same/neighboring
