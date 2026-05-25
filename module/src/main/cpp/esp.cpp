@@ -235,10 +235,29 @@ static void refresh_display_data() {
         }
     }
 
-    // Read the global -- this should be the current frame's DisplayInfoData*.
-    // No function call: just a pointer dereference of a known native global.
-    void *buf = *(void **)cached_global_addr;
-    g_disp_buf = buf;
+    // v41: chain through the deref ladder that GetDisplayData itself walks.
+    // ARM64 disasm of fn body @insn[7-12] revealed:
+    //   x19 = *(global)            <- managed state object  (cached above)
+    //   x8  = *(x19 + 0xb8)         <- managed inner ptr
+    //   x0  = *(x8  + 0x58)         <- final ptr, looks like List<DisplayInfoData>
+    //   w8  = *(x0  + 0x18)         <- list._size (standard mscorlib List<>)
+    //   items = *(x0 + 0x10)        <- list._items (T[] managed array)
+    //   elements start at items + 0x18 (aarch64 sgame Il2CppArray layout)
+    // We chase the same chain in pure memory reads.
+    void *state = *(void **)cached_global_addr;
+    if (!is_plausible_ptr(state)) { g_disp_buf = nullptr; g_disp_count = 0; return; }
+    void *inner = *(void **)((char *)state + 0xb8);
+    if (!is_plausible_ptr(inner)) { g_disp_buf = nullptr; g_disp_count = 0; return; }
+    void *list = *(void **)((char *)inner + 0x58);
+    if (!is_plausible_ptr(list)) { g_disp_buf = nullptr; g_disp_count = 0; return; }
+    void *items = *(void **)((char *)list + 0x10);
+    int   size  = *(int   *)((char *)list + 0x18);
+    if (!is_plausible_ptr(items) || size <= 0 || size > 256) {
+        g_disp_buf = nullptr; g_disp_count = 0; return;
+    }
+    // Skip Il2CppArray header to land on element[0].
+    g_disp_buf   = (char *)items + 0x18;
+    g_disp_count = (uint32_t)size;
 
     // Apply same trick to GetDisplayData_Count -- but optimistically:
     // its native fn likely loads count from a global at the same/neighboring
