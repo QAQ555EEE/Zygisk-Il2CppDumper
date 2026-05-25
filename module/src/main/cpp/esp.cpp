@@ -1,17 +1,12 @@
 //
-// ESP loop v6: fix v5 SIGSEGV + use real dict layout (+0x50 wrapper prefix)
-// v5 findings:
-//   - am ✓ (singleton is real, not empty shell)
-//   - actorList @ ActorManager+0x8, DictionaryView.Context @ +0x8 (NOT +0x10!)
-//   - dict count=7 confirmed for 5v5 match (real layout offsets shifted +0x50)
-//   - probe_offset reports raw declared offsets; real values are at probe + 0x50
-//   - ActorConfig NOT in same image as ActorManager (it's in Scripts.Base.dll)
-//   - v5 SIGSEGV was from heartbeat using hardcoded dictview+0x10 (should be +0x8)
-// v6 design:
-//   - ONE-SHOT diag, no heartbeat loop (safer)
-//   - search all images for ActorConfig class
-//   - use real dict offsets (count @ wrapper_end+0x68 etc) — but verify by scanning
-//   - iterate 7 entries, dump ActorConfig payload
+// ESP loop v7: A+B parallel
+//   A) chain ActorConfig.inner → ActorLinker → position @ +0x4C4 (validate offset)
+//   B) enumerate alternate mgrs (DimensionActorMgr, HeroManager, etc.) to find one with all actors
+//
+// Design: ONE-SHOT diag (no heartbeat loop, v6 stability proven).
+//   - sleep 60s (vs 30s in v6) to give actor spawn more time
+//   - dump ActorConfig + chain to ActorLinker + hexdump position window
+//   - probe sibling Singleton classes; for each, get s_instance and dump 0x80 bytes
 //
 
 #include "esp.h"
@@ -29,6 +24,15 @@
 
 #undef DO_API
 
+#define OFF_OBJID         0x4AC
+#define OFF_POSITION      0x4C4
+#define OFF_ROTATION      0x4D0
+
+#define OFF_AC_ACTORTYPE  0x18
+#define OFF_AC_CONFIGID   0x1c
+#define OFF_AC_CMPTYPE    0x20
+#define OFF_AC_INNER      0x50
+
 struct Vector3 { float x, y, z; };
 
 static void hexdump(const char *label, const void *p, size_t len) {
@@ -43,7 +47,6 @@ static void hexdump(const char *label, const void *p, size_t len) {
     }
 }
 
-// Find class across all loaded assemblies (handles cross-DLL refs like ActorConfig in Scripts.Base.dll)
 static Il2CppClass *find_class_anywhere(const char *ns, const char *name) {
     Il2CppDomain *domain = il2cpp_domain_get();
     if (!domain) return nullptr;
@@ -53,144 +56,120 @@ static Il2CppClass *find_class_anywhere(const char *ns, const char *name) {
         const Il2CppImage *img = il2cpp_assembly_get_image(assemblies[i]);
         Il2CppClass *k = il2cpp_class_from_name(img, ns, name);
         if (k) {
-            LOGI("[esp] found %s.%s in %s", ns, name, il2cpp_image_get_name(img));
+            LOGI("[esp v7] found %s.%s in %s", ns, name, il2cpp_image_get_name(img));
             return k;
         }
     }
-    LOGE("[esp] class %s.%s NOT FOUND in any image", ns, name);
     return nullptr;
 }
 
-static int probe_offset(Il2CppClass *klass, const char *name) {
-    FieldInfo *f = il2cpp_class_get_field_from_name(klass, name);
-    if (!f) { LOGI("[esp]   field '%s' NOT FOUND", name); return -1; }
-    int off = il2cpp_field_get_offset(f);
-    LOGI("[esp]   field '%s' offset=0x%x", name, off);
-    return off;
+static void *get_singleton_instance(Il2CppClass *klass) {
+    if (!klass) return nullptr;
+    Il2CppClass *parent = il2cpp_class_get_parent(klass);
+    FieldInfo *f = il2cpp_class_get_field_from_name(parent, "s_instance");
+    if (!f) f = il2cpp_class_get_field_from_name(klass, "s_instance");
+    if (!f) return nullptr;
+    void *inst = nullptr;
+    il2cpp_field_static_get_value(f, &inst);
+    return inst;
 }
 
-// Scan a memory region for a 4-byte value at 8-byte alignment, return offset or -1
-static int scan_for_int32(const void *base, size_t len, uint32_t needle) {
-    for (size_t off = 0; off + 4 <= len; off += 4) {
-        if (*(uint32_t *)((const char *)base + off) == needle) return (int)off;
+static void probe_singleton(const char *ns, const char *name) {
+    Il2CppClass *k = find_class_anywhere(ns, name);
+    if (!k) { LOGI("[esp v7] %s.%s NOT FOUND", ns, name); return; }
+    void *inst = get_singleton_instance(k);
+    LOGI("[esp v7] %s.%s s_instance=%p", ns, name, inst);
+    if (inst) {
+        hexdump(name, inst, 0x80);
     }
-    return -1;
 }
 
-static void esp_loop(const char *game_data_dir) {
-    LOGI("[esp v6] thread start, tid=%d", gettid());
-    sleep(30);
-    LOGI("[esp v6] post-warmup-30s");
-
+static void part_a_actor_chain(void) {
+    LOGI("[esp v7] ========== PART A: actorList chain ==========");
     Il2CppClass *am_klass = find_class_anywhere("Assets.Scripts.GameLogic", "ActorManager");
-    if (!am_klass) return;
+    if (!am_klass) { LOGE("[esp v7] no ActorManager"); return; }
 
-    Il2CppClass *singleton_klass = il2cpp_class_get_parent(am_klass);
-    FieldInfo *s_inst_field = il2cpp_class_get_field_from_name(singleton_klass, "s_instance");
-    if (!s_inst_field) s_inst_field = il2cpp_class_get_field_from_name(am_klass, "s_instance");
-    if (!s_inst_field) { LOGE("[esp v6] s_instance not found"); return; }
+    void *am = get_singleton_instance(am_klass);
+    LOGI("[esp v7] am=%p", am);
+    if (!am) return;
 
     FieldInfo *f_actorList = il2cpp_class_get_field_from_name(am_klass, "actorList");
     int off_actorList = f_actorList ? il2cpp_field_get_offset(f_actorList) : -1;
-    LOGI("[esp v6] ActorManager.actorList offset=0x%x", off_actorList);
     if (off_actorList < 0) return;
 
-    // Pre-resolve ActorConfig from any image (it's in Scripts.Base.dll, not GameCore)
-    Il2CppClass *acfg_klass = find_class_anywhere("Assets.Scripts.GameLogic", "ActorConfig");
-    if (acfg_klass) {
-        LOGI("[esp v6] ActorConfig klass=%p", acfg_klass);
-        probe_offset(acfg_klass, "inner");
-        probe_offset(acfg_klass, "ConfigID");
-        probe_offset(acfg_klass, "ActorType");
-        probe_offset(acfg_klass, "CmpType");
-    }
-
-    // Wait for am to become non-NULL — at most 60 iterations (1 minute)
-    void *am = nullptr;
-    for (int i = 0; i < 60; i++) {
-        sleep(1);
-        il2cpp_field_static_get_value(s_inst_field, &am);
-        if (am) break;
-        if (i % 10 == 9) LOGI("[esp v6] still waiting for am, i=%d", i);
-    }
-    if (!am) { LOGE("[esp v6] am stayed NULL"); return; }
-
-    LOGI("[esp v6] ===== DIAG v6 =====");
-    LOGI("[esp v6] am=%p", am);
     void *dictview = *(void **)((char *)am + off_actorList);
-    LOGI("[esp v6] dictview=%p", dictview);
-    if (!dictview) { LOGE("[esp v6] dictview NULL"); return; }
+    if (!dictview) { LOGE("[esp v7] dictview NULL"); return; }
 
-    // DictionaryView.Context offset reflected (was 0x8 in v5)
     Il2CppClass *dv_klass = il2cpp_object_get_class((Il2CppObject *)dictview);
     FieldInfo *f_context = il2cpp_class_get_field_from_name(dv_klass, "Context");
     int off_ctx_raw = f_context ? il2cpp_field_get_offset(f_context) : 0;
-    LOGI("[esp v6] DictionaryView.Context raw_offset=0x%x", off_ctx_raw);
-    // If raw_offset < 0x10 then it's missing IL2CPP header offset — try both
     int off_ctx = off_ctx_raw >= 0x10 ? off_ctx_raw : (off_ctx_raw + 0x10);
     void *dict = *(void **)((char *)dictview + off_ctx);
-    LOGI("[esp v6] dict @ +0x%x = %p", off_ctx, dict);
-    if (!dict) {
-        // Fallback: try the raw offset directly
-        off_ctx = off_ctx_raw;
-        dict = *(void **)((char *)dictview + off_ctx);
-        LOGI("[esp v6] dict (fallback @ +0x%x) = %p", off_ctx, dict);
-    }
-    if (!dict) { LOGE("[esp v6] dict NULL"); return; }
+    LOGI("[esp v7] dict=%p", dict);
+    if (!dict) return;
 
-    // Dump first 0x100 bytes of dict to find real _count / _entries / _buckets positions
-    hexdump("dict", dict, 0x100);
+    int count = *(int *)((char *)dict + 0x18);
+    void *entries = *(void **)((char *)dict + 0x10);
+    LOGI("[esp v7] dict count=%d entries=%p", count, entries);
 
-    // Heuristic: locate _count by scanning for a plausible (count <= 64) followed by 0xffffffff (freeList=-1)
-    // Pattern in v5: at +0x68 we saw "07 00 00 00 ff ff ff ff"
-    int found_count_off = -1;
-    int found_count_val = -1;
-    for (int off = 0x10; off < 0xF0; off += 4) {
-        uint32_t v = *(uint32_t *)((char *)dict + off);
-        uint32_t next = *(uint32_t *)((char *)dict + off + 4);
-        if (v > 0 && v < 64 && next == 0xFFFFFFFFu) {
-            found_count_off = off;
-            found_count_val = (int)v;
-            LOGI("[esp v6] count pattern found @ +0x%x val=%d", off, (int)v);
-            break;
+    if (!entries || count <= 0 || count > 256) return;
+
+    for (int i = 0; i < count && i < 12; i++) {
+        char *e = (char *)entries + 0x18 + i * 24;
+        int hashCode = *(int *)(e + 0);
+        int next     = *(int *)(e + 4);
+        uint32_t key = *(uint32_t *)(e + 8);
+        void *ac     = *(void **)(e + 16);
+        LOGI("[esp v7] entry[%d] hash=%d next=%d key=%u ActorConfig=%p", i, hashCode, next, key, ac);
+
+        if (!ac) continue;
+        int actorType = *(int *)((char *)ac + OFF_AC_ACTORTYPE);
+        int configId  = *(int *)((char *)ac + OFF_AC_CONFIGID);
+        int cmpType   = *(int *)((char *)ac + OFF_AC_CMPTYPE);
+        void *inner   = *(void **)((char *)ac + OFF_AC_INNER);
+        LOGI("[esp v7]   AC[%u]: ActorType=%d ConfigID=%d CmpType=%d inner=%p",
+             key, actorType, configId, cmpType, inner);
+
+        char label[48];
+        snprintf(label, sizeof(label), "AC_%u", key);
+        hexdump(label, ac, 0x80);
+
+        if (inner) {
+            snprintf(label, sizeof(label), "AL_%u", key);
+            // ActorLinker dump 0x4A0..0x4E0 — covers ObjID, position, rotation
+            hexdump(label, (char *)inner + 0x4A0, 0x40);
+
+            uint32_t objId = *(uint32_t *)((char *)inner + OFF_OBJID);
+            Vector3 *pos = (Vector3 *)((char *)inner + OFF_POSITION);
+            LOGI("[esp v7]   AL[%u]: ObjID=%u pos=(%.2f, %.2f, %.2f)",
+                 key, objId, pos->x, pos->y, pos->z);
         }
     }
-    if (found_count_off < 0) {
-        // Also try without -1 sentinel (post-fill freeList may not be -1)
-        for (int off = 0x10; off < 0xF0; off += 4) {
-            uint32_t v = *(uint32_t *)((char *)dict + off);
-            if (v > 0 && v < 64) {
-                LOGI("[esp v6] candidate small int @ +0x%x = %d", off, (int)v);
-            }
-        }
-    }
+}
 
-    // If we found count, _entries = count_off - 0x10 (standard mscorlib Dictionary stride: buckets,entries,count)
-    if (found_count_off >= 0) {
-        int entries_off = found_count_off - 0x8;
-        int buckets_off = found_count_off - 0x10;
-        void *entries = *(void **)((char *)dict + entries_off);
-        void *buckets = *(void **)((char *)dict + buckets_off);
-        LOGI("[esp v6] inferred entries @ +0x%x = %p", entries_off, entries);
-        LOGI("[esp v6] inferred buckets @ +0x%x = %p", buckets_off, buckets);
+static void part_b_alt_mgrs(void) {
+    LOGI("[esp v7] ========== PART B: alternate mgr probes ==========");
+    probe_singleton("Assets.Scripts.GameLogic", "DimensionActorMgr");
+    probe_singleton("Assets.Scripts.GameLogic", "HeroManager");
+    probe_singleton("Assets.Scripts.GameLogic", "SoldierManager");
+    probe_singleton("Assets.Scripts.GameLogic", "OrganManager");
+    probe_singleton("Assets.Scripts.GameLogic", "MonsterManager");
+    probe_singleton("Assets.Scripts.GameLogic", "PlayerManager");
+    probe_singleton("Assets.Scripts.GameLogic", "GameLogicAPI");
+    probe_singleton("Assets.Scripts.GameLogic", "BattleManager");
+    probe_singleton("Assets.Scripts.GameLogic", "DimensionBaseWorld");
+    probe_singleton("Assets.Scripts.GameLogic", "DimensionPVPWorld");
+}
 
-        if (entries) {
-            uint64_t arr_len = *(uint64_t *)((char *)entries + 0x18);
-            LOGI("[esp v6] entries.length(arr_header+0x18)=%llu", (unsigned long long)arr_len);
-            hexdump("entries_hdr", entries, 0x40);
-            // Dump first 3 entry candidates at standard mscorlib stride 24
-            // Entry { int hashCode; int next; TKey key; TValue value }
-            // Dictionary<UInt32, ActorConfig>: hash(4)+next(4)+key(4)+pad(4)+value(8) = 24
-            for (int i = 0; i < 8 && i < found_count_val + 2; i++) {
-                char label[48];
-                snprintf(label, sizeof(label), "e[%d]", i);
-                hexdump(label, (char *)entries + 0x20 + i * 24, 24);
-            }
-        }
-    }
+static void esp_loop(const char *game_data_dir) {
+    LOGI("[esp v7] thread start, tid=%d", gettid());
+    sleep(60);  // Extended warmup — give 5v5 actors more time to spawn
+    LOGI("[esp v7] post-warmup-60s");
 
-    LOGI("[esp v6] ===== END DIAG v6 (no further reads) =====");
-    // INTENTIONALLY no heartbeat loop — avoids crash & reduces footprint
+    part_a_actor_chain();
+    part_b_alt_mgrs();
+
+    LOGI("[esp v7] ========== END DIAG v7 ==========");
 }
 
 void esp_start(const char *game_data_dir) {
