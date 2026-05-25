@@ -327,13 +327,19 @@ static int scan_heroes(std::vector<EspActor> &out) {
                         void *ac     = *(void **)(e + 16);
                         if (!is_plausible_ptr(ac)) continue;
                         int32_t  atype = *(int32_t  *)((char *)ac + 0x18);
-                        int32_t  cmp   = *(int32_t  *)((char *)ac + 0x20);
-                        int32_t  cfg   = *(int32_t  *)((char *)ac + 0x1c);
                         if (atype != 0) continue;   // ActorTypeDef.HERO
                         void *inner = *(void **)((char *)ac + 0x50);
                         if (!is_plausible_ptr(inner)) continue;
                         void *al    = *(void **)((char *)inner + 0x08);
                         if (!is_plausible_ptr(al)) continue;
+                        // v34: ActorConfig.CmpType@+0x20 and .ConfigID@+0x1c are
+                        // ALWAYS 0 in this sgame build (placeholder template ACs).
+                        // PC-side hex scan in v33 found the live values live on
+                        // ActorLinker instead:
+                        //   AL +0x56c = COM_PLAYERCAMP (1=blue, 2=red) verified
+                        //   AL +0x38  = hero config ID (114/128/152/... matches sgame hero IDs)
+                        int32_t cmp = *(int32_t *)((char *)al + 0x56c);
+                        int32_t cfg = *(int32_t *)((char *)al + 0x038);
                         EspActor a{};
                         a.key  = key;
                         a.type = 0;
