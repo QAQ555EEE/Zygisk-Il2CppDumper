@@ -342,8 +342,18 @@ static int scan_heroes(std::vector<EspActor> &out) {
                         a.objId    = *(uint32_t *)((char *)al + 0x4AC);
                         float *p = (float *)((char *)al + 0x4C4);
                         a.x = p[0]; a.y = p[1]; a.z = p[2];
-                        int32_t *f = (int32_t *)((char *)al + 0x4B8);
-                        a.fwd_x = f[0]; a.fwd_y = f[1]; a.fwd_z = f[2];
+                        // v33 RE-mode: overlay doesn't draw forward, so reuse fwd_x/y/z to
+                        // carry the ActorConfig + ActorLinker pointers out to PC-side
+                        // python so it can process_vm_readv-hexdump them live without
+                        // another build cycle.
+                        //   fwd_x = ActorConfig low32
+                        //   fwd_y = ActorConfig high32
+                        //   fwd_z = ActorLinker low32  (high32 implied = ActorConfig high32, same heap region)
+                        uintptr_t ac_u = (uintptr_t)ac;
+                        uintptr_t al_u = (uintptr_t)al;
+                        a.fwd_x = (int32_t)(ac_u & 0xFFFFFFFFu);
+                        a.fwd_y = (int32_t)((ac_u >> 32) & 0xFFFFFFFFu);
+                        a.fwd_z = (int32_t)(al_u & 0xFFFFFFFFu);
                         out.push_back(a);
                         if (hero_emitted < 6) {
                             LOGI("[esp v33] hero[%d] key=%u cfg=%d camp=%d pos=(%.1f,%.1f,%.1f) obj=%u",
