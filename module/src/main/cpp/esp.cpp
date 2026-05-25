@@ -511,22 +511,40 @@ static int scan_heroes(std::vector<EspActor> &out) {
                                     for (uint32_t i = 0; i < 64; ++i) {
                                         const char *e = base + i * stride;
                                         uint32_t aid = *(const uint32_t *)e;
-                                        if (aid == want) {
-                                            // Try +0x10 (managed-style layout) for position
-                                            float *cand = (float *)(e + 0x10);
-                                            if (cand[0] > -200.0f && cand[0] < 200.0f &&
-                                                cand[2] > -200.0f && cand[2] < 200.0f) {
-                                                p = cand; found = true;
-                                                // Log first successful hit for sanity
-                                                static bool logged = false;
-                                                if (!logged) {
-                                                    LOGI("[esp v39] HIT base=+0x%zx stride=0x%zx i=%u actorID=%u pos=(%.1f,%.1f,%.1f)",
-                                                         BASES[bi], stride, i, want, cand[0], cand[1], cand[2]);
-                                                    logged = true;
-                                                }
-                                            }
-                                            break;
+                                        if (aid != want) continue;
+                                        // v40: scan multiple position offsets inside the entry
+                                        // until we find 3 floats in plausible map range.
+                                        static bool logged_hex = false;
+                                        if (!logged_hex) {
+                                            const uint64_t *q = (const uint64_t *)e;
+                                            LOGI("[esp v40] entry @ base=+0x%zx stride=0x%zx i=%u actorID=%u hex: %016llx %016llx %016llx %016llx %016llx %016llx %016llx %016llx",
+                                                 BASES[bi], stride, i, want,
+                                                 (unsigned long long)q[0], (unsigned long long)q[1],
+                                                 (unsigned long long)q[2], (unsigned long long)q[3],
+                                                 (unsigned long long)q[4], (unsigned long long)q[5],
+                                                 (unsigned long long)q[6], (unsigned long long)q[7]);
+                                            logged_hex = true;
                                         }
+                                        // Try position offset 0x04, 0x08, 0x0c, 0x10, 0x14, 0x18, 0x1c
+                                        for (size_t po = 0x04; po <= 0x1c; po += 0x04) {
+                                            float *cand = (float *)(e + po);
+                                            float x = cand[0], y = cand[1], z = cand[2];
+                                            // valid: not NaN, x and z in (-200,+200), y small
+                                            if (x == x && z == z && y == y &&  // NaN check
+                                                x > -200.0f && x < 200.0f &&
+                                                z > -200.0f && z < 200.0f &&
+                                                y > -50.0f && y < 50.0f) {
+                                                p = cand; found = true;
+                                                static bool logged_pos = false;
+                                                if (!logged_pos) {
+                                                    LOGI("[esp v40] PICK pos_off=+0x%zx actorID=%u pos=(%.1f,%.1f,%.1f)",
+                                                         po, want, x, y, z);
+                                                    logged_pos = true;
+                                                }
+                                                break;
+                                            }
+                                        }
+                                        break;
                                     }
                                 }
                             }
