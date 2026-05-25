@@ -55,42 +55,46 @@ public class OverlayView extends View {
 
         int heroCount = 0;
         int enemyHero = 0;
-        // Draw dots: heroes biggest+colored, others small grey
+        // Pass 1: towers/spring (background)
         for (OverlayService.Actor a : actors) {
+            if (a.camp != 1 && a.camp != 2) continue;
             float dx = cx + a.x * scale;
-            float dy = cy - a.z * scale;  // z up on minimap (flip)
+            float dy = cy - a.z * scale;
             if (dx < left || dx > left + mapSize || dy < top || dy > top + mapSize) continue;
-
-            int color;
-            float radius;
-            if (a.type == 2) { // hero
-                heroCount++;
-                if (a.camp == 1) {        // blue (me)
-                    color = Color.argb(255, 80, 180, 255);
-                    radius = 14f;
-                } else if (a.camp == 2) { // red (enemy)
-                    color = Color.argb(255, 255, 70, 70);
-                    radius = 14f;
-                    enemyHero++;
-                } else {
-                    color = Color.YELLOW;
-                    radius = 10f;
-                }
-            } else if (a.type == 1) { // tower
-                color = Color.argb(200, 200, 200, 200);
-                radius = 8f;
-            } else if (a.type == 5) { // spring
-                color = Color.argb(180, 100, 255, 100);
-                radius = 7f;
-            } else {                  // type 0 = monster/soldier
-                color = Color.argb(160, 180, 180, 100);
-                radius = 4f;
+            if (a.type == 1) { // tower
+                dotPaint.setColor(a.camp == 1 ? Color.argb(220, 80, 180, 255)
+                                              : Color.argb(220, 255, 100, 100));
+                c.drawRect(dx-6, dy-6, dx+6, dy+6, dotPaint);
+            } else if (a.type == 5) { // spring/crystal
+                dotPaint.setColor(a.camp == 1 ? Color.argb(220, 0, 200, 255)
+                                              : Color.argb(220, 255, 60, 60));
+                c.drawRect(dx-9, dy-9, dx+9, dy+9, dotPaint);
             }
-            dotPaint.setColor(color);
-            c.drawCircle(dx, dy, radius, dotPaint);
+        }
+        // Pass 2: heroes (foreground, big circles with halo)
+        for (OverlayService.Actor a : actors) {
+            if (a.type != 2 || (a.camp != 1 && a.camp != 2)) continue;
+            heroCount++;
+            float dx = cx + a.x * scale;
+            float dy = cy - a.z * scale;
+            if (dx < left || dx > left + mapSize || dy < top || dy > top + mapSize) continue;
+            int main, halo;
+            if (a.camp == 1) {
+                main = Color.argb(255, 80, 180, 255);
+                halo = Color.argb(80, 80, 180, 255);
+            } else {
+                main = Color.argb(255, 255, 70, 70);
+                halo = Color.argb(100, 255, 70, 70);
+                enemyHero++;
+            }
+            dotPaint.setColor(halo);
+            c.drawCircle(dx, dy, 22f, dotPaint);
+            dotPaint.setColor(main);
+            c.drawCircle(dx, dy, 12f, dotPaint);
         }
 
-        c.drawText("actors=" + actors.length + "  enemy=" + enemyHero,
+        c.drawText("heroes=" + heroCount + "  enemy=" + enemyHero
+                   + "  /" + actors.length,
                    left + 8, top + 30, textPaint);
     }
 }
