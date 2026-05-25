@@ -159,24 +159,37 @@ static void refresh_display_data() {
         return;
     }
 
-    Il2CppException *exc = nullptr;
-    // GetDisplayData returns DisplayInfoData* (raw native pointer, boxed as IntPtr).
-    Il2CppObject *boxed_ptr = il2cpp_runtime_invoke(cached_m_data, nullptr, nullptr, &exc);
-    if (exc || !boxed_ptr) { g_disp_buf = nullptr; g_disp_count = 0; return; }
-    // The IntPtr value lives right after the Il2CppObject header (klass+monitor = 0x10).
-    void *raw = *(void **)((char *)boxed_ptr + 0x10);
-    g_disp_buf = raw;
-
-    exc = nullptr;
-    Il2CppObject *boxed_cnt = il2cpp_runtime_invoke(cached_m_count, nullptr, nullptr, &exc);
-    if (exc || !boxed_cnt) { g_disp_count = 0; return; }
-    g_disp_count = *(uint32_t *)((char *)boxed_cnt + 0x10);
+    // v37: bypass il2cpp_runtime_invoke trampoline -- ACE monitors managed→native
+    // transitions through the trampoline. Read the raw native function pointer
+    // out of MethodInfo and call it directly so the stack frame above looks
+    // like one native fn calling another with no IL2CPP runtime in between.
+    //
+    // MethodInfo layout (aarch64 Il2Cpp standard):
+    //   +0x00 methodPointer (Il2CppMethodPointer = void* native fn ptr)
+    //   +0x08 invoker_method
+    //   ...
+    //
+    // SGW.GetDisplayData() is a static no-arg method that returns DisplayInfoData*.
+    // The native trampoline ABI in IL2CPP passes the MethodInfo as the last hidden
+    // arg, so we call as `fn(methodInfo)` to be safe.
+    typedef void *(*GetDataFn)(const MethodInfo *);
+    typedef uint32_t (*GetCountFn)(const MethodInfo *);
+    void *raw_data_fn  = *(void **)((char *)cached_m_data + 0x00);
+    void *raw_count_fn = *(void **)((char *)cached_m_count + 0x00);
+    if (!raw_data_fn || !raw_count_fn) {
+        g_disp_buf = nullptr; g_disp_count = 0; return;
+    }
+    void     *buf = ((GetDataFn)raw_data_fn)(cached_m_data);
+    uint32_t  cnt = ((GetCountFn)raw_count_fn)(cached_m_count);
+    g_disp_buf   = buf;
+    g_disp_count = cnt;
 
     if (!init_logged_ok && g_disp_buf && g_disp_count) {
-        LOGI("[esp v36] SGW first frame: buf=%p count=%u", g_disp_buf, g_disp_count);
-        // Hex dump first entry to verify layout (DisplayInfoData)
+        LOGI("[esp v37] SGW first frame (direct methodPointer): buf=%p count=%u",
+             g_disp_buf, g_disp_count);
+        LOGI("[esp v37] methodPointers: data_fn=%p count_fn=%p", raw_data_fn, raw_count_fn);
         const uint64_t *q = (const uint64_t *)g_disp_buf;
-        LOGI("[esp v36] disp[0] hex: %016llx %016llx %016llx %016llx %016llx %016llx %016llx %016llx",
+        LOGI("[esp v37] disp[0] hex: %016llx %016llx %016llx %016llx %016llx %016llx %016llx %016llx",
              (unsigned long long)q[0], (unsigned long long)q[1],
              (unsigned long long)q[2], (unsigned long long)q[3],
              (unsigned long long)q[4], (unsigned long long)q[5],
