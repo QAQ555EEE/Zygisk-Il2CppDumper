@@ -8,8 +8,6 @@ import android.content.Context;
 import android.content.Intent;
 import android.content.pm.ServiceInfo;
 import android.graphics.PixelFormat;
-import android.net.LocalSocket;
-import android.net.LocalSocketAddress;
 import android.os.Build;
 import android.os.IBinder;
 import android.util.Log;
@@ -17,12 +15,17 @@ import android.view.Gravity;
 import android.view.WindowManager;
 
 import java.io.DataInputStream;
+import java.net.InetSocketAddress;
+import java.net.Socket;
 import java.nio.ByteBuffer;
 import java.nio.ByteOrder;
 
 public class OverlayService extends Service {
     private static final String TAG = "sgame_overlay";
-    private static final String SOCK = "sgame_esp";   // abstract namespace
+    // SELinux blocks untrusted_app -> untrusted_app abstract unix sockets,
+    // so we use TCP loopback instead.
+    private static final String SOCK_HOST = "127.0.0.1";
+    private static final int SOCK_PORT = 47291;
     private static final int ACTOR_BYTES = 52;
 
     private WindowManager wm;
@@ -76,7 +79,7 @@ public class OverlayService extends Service {
             ? new Notification.Builder(this, ch)
             : new Notification.Builder(this);
         Notification n = b.setContentTitle("sgame ESP overlay")
-            .setContentText("等待 sgame 连接...")
+            .setContentText("绛夊緟 sgame 杩炴帴...")
             .setSmallIcon(android.R.drawable.ic_dialog_info)
             .build();
         if (Build.VERSION.SDK_INT >= 34) {
@@ -88,11 +91,10 @@ public class OverlayService extends Service {
 
     private void socketLoop() {
         while (running) {
-            LocalSocket sock = new LocalSocket();
+            Socket sock = new Socket();
             try {
-                sock.connect(new LocalSocketAddress(SOCK,
-                    LocalSocketAddress.Namespace.ABSTRACT));
-                Log.i(TAG, "connected @" + SOCK);
+                sock.connect(new InetSocketAddress(SOCK_HOST, SOCK_PORT), 3000);
+                Log.i(TAG, "connected " + SOCK_HOST + ":" + SOCK_PORT);
                 DataInputStream in = new DataInputStream(sock.getInputStream());
 
                 byte[] hdrBuf = new byte[8];
