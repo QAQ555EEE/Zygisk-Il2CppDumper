@@ -49,6 +49,7 @@
 #include <netinet/in.h>
 #include <arpa/inet.h>
 #include <errno.h>
+#include <dlfcn.h>
 
 #define DO_API(r, n, p) extern r (*n) p
 #include "il2cpp-api-functions.h"
