@@ -636,13 +636,33 @@ static int scan_heroes(std::vector<EspActor> &out) {
                         if (is_plausible_ptr(sc)) {
                             void *ako = *(void **)((char *)sc + 0x40);
                             if (is_plausible_ptr(ako)) {
-                                float *wpos = (float *)((char *)ako + 0x24);
-                                static int wlog_count = 0;
-                                if (wlog_count < 30) {
-                                    uint32_t akid = *(uint32_t *)((char *)ako + 0x50);
-                                    LOGI("[esp v45] actor key=%u AL.pos=(%.1f,%.1f,%.1f) AkGameObj.pos=(%.1f,%.1f,%.1f) akID=%u",
-                                         key, p[0], p[1], p[2], wpos[0], wpos[1], wpos[2], akid);
-                                    wlog_count++;
+                                uint32_t akid = *(uint32_t *)((char *)ako + 0x50);
+                                // v46: call CSharp_GetPosition(akID) — native C export,
+                                // not IL2CPP managed. dlsym → direct call.
+                                // Wwise is third-party middleware; ACE shouldn't monitor.
+                                // Signature (SWIG): void(*)(uint32, AkSoundPosition*)
+                                //   AkSoundPosition: 3*Vector3 = position(12) + orientFront(12) + orientTop(12) = 36B
+                                static void *(*ak_get_pos)(uint32_t, void *) = nullptr;
+                                static bool dlsym_tried = false;
+                                if (!dlsym_tried) {
+                                    dlsym_tried = true;
+                                    void *h = dlopen("libAkSoundEngine.so", RTLD_NOW | RTLD_NOLOAD);
+                                    if (h) {
+                                        ak_get_pos = (void *(*)(uint32_t, void *))dlsym(h, "CSharp_GetPosition");
+                                        LOGI("[esp v46] dlsym CSharp_GetPosition handle=%p fn=%p", h, ak_get_pos);
+                                    } else {
+                                        LOGI("[esp v46] dlopen libAkSoundEngine.so NOLOAD failed");
+                                    }
+                                }
+                                if (ak_get_pos) {
+                                    float ak_pos[9] = {0};
+                                    ak_get_pos(akid, ak_pos);
+                                    static int wlog_count = 0;
+                                    if (wlog_count < 30) {
+                                        LOGI("[esp v46] actor key=%u AL=(%.1f,%.1f,%.1f) Wwise=(%.1f,%.1f,%.1f) akID=%u",
+                                             key, p[0], p[1], p[2], ak_pos[0], ak_pos[1], ak_pos[2], akid);
+                                        wlog_count++;
+                                    }
                                 }
                             }
                         }
