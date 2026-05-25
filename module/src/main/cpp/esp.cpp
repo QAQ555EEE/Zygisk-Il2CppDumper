@@ -346,7 +346,26 @@ static int scan_heroes(std::vector<EspActor> &out) {
                         a.configId = cfg;
                         a.camp     = cmp;
                         a.objId    = *(uint32_t *)((char *)al + 0x4AC);
-                        float *p = (float *)((char *)al + 0x4C4);
+
+                        // v35: try MoveComponent.remotePosition (server-side raw,
+                        // no FOW filter) instead of ActorLinker.position (client
+                        // render, frozen at last-visible while FOW'd).
+                        //   ActorLinker +0x420 = MoveControl (MoveComponent*)
+                        //   MoveComponent +0x28 = curPosition  (client interpolated)
+                        //   MoveComponent +0x34 = remotePosition (server raw)
+                        // Fall back to ActorLinker.position@+0x4C4 if MC NULL.
+                        float *p = nullptr;
+                        void *mc = *(void **)((char *)al + 0x420);
+                        if (is_plausible_ptr(mc)) {
+                            p = (float *)((char *)mc + 0x34);
+                            // Sanity: remotePosition should look like a sgame map coord (~-65..+65)
+                            if (!(p[0] > -200.0f && p[0] < 200.0f && p[2] > -200.0f && p[2] < 200.0f)) {
+                                p = nullptr;
+                            }
+                        }
+                        if (!p) {
+                            p = (float *)((char *)al + 0x4C4);  // fallback to render-layer
+                        }
                         a.x = p[0]; a.y = p[1]; a.z = p[2];
                         // v33 RE-mode: overlay doesn't draw forward, so reuse fwd_x/y/z to
                         // carry the ActorConfig + ActorLinker pointers out to PC-side
