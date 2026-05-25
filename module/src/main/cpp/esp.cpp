@@ -637,30 +637,27 @@ static int scan_heroes(std::vector<EspActor> &out) {
                             void *ako = *(void **)((char *)sc + 0x40);
                             if (is_plausible_ptr(ako)) {
                                 uint32_t akid = *(uint32_t *)((char *)ako + 0x50);
-                                // v46: call CSharp_GetPosition(akID) — native C export,
-                                // not IL2CPP managed. dlsym → direct call.
-                                // Wwise is third-party middleware; ACE shouldn't monitor.
-                                // Signature (SWIG): void(*)(uint32, AkSoundPosition*)
-                                //   AkSoundPosition: 3*Vector3 = position(12) + orientFront(12) + orientTop(12) = 36B
-                                static void *(*ak_get_pos)(uint32_t, void *) = nullptr;
+                                // signature via disasm @ libAkSoundEngine.so:0x6c5f0
+                                //   int CSharp_GetPosition(uint32 akID, AkSoundPosition* out)
+                                //   rc 0=success, 2=NULL ptr or AkGameObj not registered
+                                //   AkSoundPosition: pos[3], orientFront[3], orientTop[3]
+                                static int (*ak_get_pos)(uint32_t, void *) = nullptr;
                                 static bool dlsym_tried = false;
                                 if (!dlsym_tried) {
                                     dlsym_tried = true;
                                     void *h = dlopen("libAkSoundEngine.so", RTLD_NOW | RTLD_NOLOAD);
                                     if (h) {
-                                        ak_get_pos = (void *(*)(uint32_t, void *))dlsym(h, "CSharp_GetPosition");
-                                        LOGI("[esp v46] dlsym CSharp_GetPosition handle=%p fn=%p", h, ak_get_pos);
-                                    } else {
-                                        LOGI("[esp v46] dlopen libAkSoundEngine.so NOLOAD failed");
+                                        ak_get_pos = (int (*)(uint32_t, void *))dlsym(h, "CSharp_GetPosition");
                                     }
+                                    LOGI("[esp v47] dlsym CSharp_GetPosition handle=%p fn=%p", h, (void *)ak_get_pos);
                                 }
                                 if (ak_get_pos) {
-                                    float ak_pos[9] = {0};
-                                    ak_get_pos(akid, ak_pos);
+                                    float ak_pos[9] = {-9999, -9999, -9999, 0, 0, 0, 0, 0, 0};
+                                    int rc = ak_get_pos(akid, ak_pos);
                                     static int wlog_count = 0;
                                     if (wlog_count < 30) {
-                                        LOGI("[esp v46] actor key=%u AL=(%.1f,%.1f,%.1f) Wwise=(%.1f,%.1f,%.1f) akID=%u",
-                                             key, p[0], p[1], p[2], ak_pos[0], ak_pos[1], ak_pos[2], akid);
+                                        LOGI("[esp v47] key=%u akID=%u rc=%d AL=(%.1f,_,%.1f) Wwise=(%.1f,%.1f,%.1f)",
+                                             key, akid, rc, p[0], p[2], ak_pos[0], ak_pos[1], ak_pos[2]);
                                         wlog_count++;
                                     }
                                 }
