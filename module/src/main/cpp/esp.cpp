@@ -157,134 +157,92 @@ static bool emit_player(void *player, uint32_t key, std::vector<EspActor> &out) 
     return true;
 }
 
-// Returns number of heroes emitted (0 if GPC not ready / match not started).
+// v28: switched from m_playerLinkerList (DictionaryView, always empty in this
+// sgame build) to playersCache (+0x50, ListView<Player>). v27 hexdump proved
+// hostPlayer @ gpc+0x48 has correct camp/cfg/captain — so Player layout is fine.
+// We just needed a populated container.
 //
-// Edge-triggered diagnostic LOG: each failure stage logs only the first time
-// it's reached (so 0-spam during normal operation) and again any time the
-// failing stage changes. Lets us read logcat once and see where we got stuck.
+// Chain:
+//   gpc + 0x50      → ListView<Player>
+//     +0x18 (Context, ListViewBase) → List<Player>
+//       +0x10 _items (Player[])
+//       +0x18 _size  (int)
+//     T[]  +0x18 elements
+//
+// ListView fallback order: playersCache (+0x50) -> _playersTempList (+0x30).
+// We also always emit hostPlayer (+0x48) as a guaranteed lower-bound so the
+// overlay shows something even before BuildPlayers populates the cache.
 static int scan_heroes(std::vector<EspActor> &out) {
     out.clear();
 
     static Il2CppClass *cached_klass = nullptr;
     static FieldInfo *cached_s_inst = nullptr;
-    static int       cached_dv_ctx  = -1;
-    static int       last_stage = -1;   // 0=no_klass 1=no_s_inst 2=no_gpc 3=no_dictview 4=no_dict 5=bad_count 6=ok
-    auto log_stage = [](int s, const char *msg, int extra = 0) {
-        if (s == last_stage) return;
-        last_stage = s;
-        if (extra) LOGI("[esp v24] stage=%d %s extra=%d", s, msg, extra);
-        else       LOGI("[esp v24] stage=%d %s", s, msg);
+    static int last_status = -1;
+    auto status_log = [](int s, const char *msg, int extra = 0) {
+        if (s == last_status) return;
+        last_status = s;
+        if (extra) LOGI("[esp v28] %s extra=%d", msg, extra);
+        else       LOGI("[esp v28] %s", msg);
     };
 
     if (!cached_klass) {
         cached_klass = find_class_anywhere("Assets.Scripts.GameLogic", "GamePlayerCenter");
-        if (!cached_klass) { log_stage(0, "GamePlayerCenter klass NOT_FOUND"); return 0; }
-        LOGI("[esp v24] GamePlayerCenter klass=%p", cached_klass);
+        if (!cached_klass) { status_log(0, "klass NOT_FOUND"); return 0; }
         Il2CppClass *parent = il2cpp_class_get_parent(cached_klass);
         cached_s_inst = il2cpp_class_get_field_from_name(parent, "s_instance");
         if (!cached_s_inst)
             cached_s_inst = il2cpp_class_get_field_from_name(cached_klass, "s_instance");
-        if (!cached_s_inst) { log_stage(1, "s_instance field NOT_FOUND"); return 0; }
-        LOGI("[esp v24] s_instance FieldInfo=%p", cached_s_inst);
+        if (!cached_s_inst) { status_log(1, "s_instance NOT_FOUND"); return 0; }
+        LOGI("[esp v28] init OK klass=%p s_inst=%p", cached_klass, cached_s_inst);
     }
 
     void *gpc = nullptr;
     il2cpp_field_static_get_value(cached_s_inst, &gpc);
-    if (!is_plausible_ptr(gpc)) { log_stage(2, "gpc s_instance NULL/garbage"); return 0; }
+    if (!is_plausible_ptr(gpc)) { status_log(2, "gpc NULL"); return 0; }
 
-    void *dictview = *(void **)((char *)gpc + GPC_PLAYER_LIST);
-    if (!is_plausible_ptr(dictview)) {
-        log_stage(3, "m_playerLinkerList NULL");
-        LOGI("[esp v24] gpc=%p dictview_raw=%p", gpc, dictview);
-        return 0;
-    }
-
-    if (cached_dv_ctx < 0) {
-        Il2CppClass *dv_klass = il2cpp_object_get_class((Il2CppObject *)dictview);
-        FieldInfo *f_ctx = dv_klass ? il2cpp_class_get_field_from_name(dv_klass, "Context") : nullptr;
-        int raw = f_ctx ? il2cpp_field_get_offset(f_ctx) : 0x8;
-        cached_dv_ctx = raw >= 0x10 ? raw : (raw + 0x10);
-        LOGI("[esp v24] DictionaryView.Context @ +0x%x (raw=0x%x)", cached_dv_ctx, raw);
-    }
-
-    void *dict = *(void **)((char *)dictview + cached_dv_ctx);
-    if (!is_plausible_ptr(dict)) { log_stage(4, "Context dict NULL"); return 0; }
-
-    // === v26 dict hexdump: log first 0x40 bytes once per state-change to find
-    // the right count/entries offsets if mscorlib layout differs in this build.
-    // === v27 layout probe: read count + entries at BOTH layout hypotheses,
-    // dump dict + entries-array hex periodically, log GPC alt-field state.
-    // mscorlib standard says _count@+0x20 (after _buckets@+0x10, _entries@+0x18).
-    int   count_h1 = *(int   *)((char *)dict + 0x18);  // legacy v6-memory layout
-    int   count_h2 = *(int   *)((char *)dict + 0x20);  // dump.cs standard mscorlib layout
-    void *entries_h1 = *(void **)((char *)dict + 0x10);
-    void *entries_h2 = *(void **)((char *)dict + 0x18);
-    void *entries_h3 = *(void **)((char *)dict + 0x20);
-
-    static int periodic_counter = 0;
-    bool do_dump = (last_stage != 5) || (++periodic_counter % 60 == 0);
-    if (do_dump) {
-        const uint64_t *q = (const uint64_t *)dict;
-        LOGI("[esp v27] dict@%p hex: %016llx %016llx %016llx %016llx %016llx %016llx %016llx %016llx",
-             dict,
-             (unsigned long long)q[0], (unsigned long long)q[1],
-             (unsigned long long)q[2], (unsigned long long)q[3],
-             (unsigned long long)q[4], (unsigned long long)q[5],
-             (unsigned long long)q[6], (unsigned long long)q[7]);
-        LOGI("[esp v27] count h1@+0x18=%d h2@+0x20=%d ; entries h1@+0x10=%p h2@+0x18=%p h3@+0x20=%p",
-             count_h1, count_h2, entries_h1, entries_h2, entries_h3);
-
-        // Try entries-h3 (+0x20 hypothesis from dump.cs). If it's a managed array, dump 64 bytes.
-        if (is_plausible_ptr(entries_h3)) {
-            const uint64_t *e = (const uint64_t *)entries_h3;
-            LOGI("[esp v27] entries_h3@%p hex: %016llx %016llx %016llx %016llx %016llx %016llx %016llx %016llx",
-                 entries_h3, (unsigned long long)e[0], (unsigned long long)e[1],
-                 (unsigned long long)e[2], (unsigned long long)e[3],
-                 (unsigned long long)e[4], (unsigned long long)e[5],
-                 (unsigned long long)e[6], (unsigned long long)e[7]);
+    // Helper: iterate a ListView<Player> at gpc+offset, emit each Player.
+    auto try_listview = [&](int offset, const char *tag) -> int {
+        void *lv = *(void **)((char *)gpc + offset);
+        if (!is_plausible_ptr(lv)) return -1;
+        // ListViewBase.Context @ raw +0x8 -> runtime +0x18 (IL2CPP header 0x10).
+        void *list = *(void **)((char *)lv + 0x18);
+        if (!is_plausible_ptr(list)) return -2;
+        // mscorlib List<T>: _items @ +0x10, _size @ +0x18.
+        void *items = *(void **)((char *)list + 0x10);
+        int   size  = *(int   *)((char *)list + 0x18);
+        if (!is_plausible_ptr(items) || size <= 0 || size > 16) return size;
+        int emitted = 0;
+        // Il2CppArray on aarch64: klass +0, monitor +8, max_length +0x10, elements +0x18.
+        for (int i = 0; i < size && i < 16; ++i) {
+            void *player = *(void **)((char *)items + 0x18 + i * sizeof(void *));
+            if (emit_player(player, (uint32_t)i, out)) emitted++;
         }
+        if (emitted > 0) {
+            int newstatus = (offset << 8) | 7;
+            if (newstatus != last_status) {
+                LOGI("[esp v28] OK via %s @+0x%x size=%d emitted=%d", tag, offset, size, emitted);
+                last_status = newstatus;
+            }
+        }
+        return emitted;
+    };
 
-        // Re-probe GPC alt fields (state may have changed since match start).
-        void *playersTempList = *(void **)((char *)gpc + 0x30);
-        void *hostPlayer      = *(void **)((char *)gpc + 0x48);
-        void *playersCache    = *(void **)((char *)gpc + 0x50);
-        uint32_t hostPlayerID = *(uint32_t *)((char *)gpc + 0x40);
-        LOGI("[esp v27] gpc[+0x30]=%p tempList; [+0x40]=%u hostPID; [+0x48]=%p hostPlayer; [+0x50]=%p cacheList",
-             playersTempList, hostPlayerID, hostPlayer, playersCache);
+    int n = try_listview(0x50, "playersCache");
+    if (n <= 0) n = try_listview(0x30, "playersTempList");
+
+    // hostPlayer fallback: even if both ListViews are empty, gpc+0x48 is the
+    // local player Player* once you've selected a hero. Emit it so the overlay
+    // shows your own dot during the loading screen / hero-pick period.
+    if (out.empty()) {
+        void *hostPlayer = *(void **)((char *)gpc + 0x48);
         if (is_plausible_ptr(hostPlayer)) {
-            int32_t hp_camp = *(int32_t *)((char *)hostPlayer + 0x8);
-            uint32_t hp_cfg  = *(uint32_t *)((char *)hostPlayer + 0x180);
-            void *hp_captain = *(void **)((char *)hostPlayer + 0x198 + 8);
-            LOGI("[esp v27] hostPlayer camp@+0x8=%d cfg@+0x180=%u captainAC=%p",
-                 hp_camp, hp_cfg, hp_captain);
+            if (emit_player(hostPlayer, 0xFFFFFFFFu, out)) {
+                if (last_status != 8) {
+                    LOGI("[esp v28] fallback to hostPlayer @+0x48 (lists still empty)");
+                    last_status = 8;
+                }
+            }
         }
-    }
-
-    // Use h2 (dump.cs ground truth) as primary count.
-    int count = count_h2;
-    void *entries = entries_h2;  // _entries @ +0x18 per dump.cs field order
-    if (!is_plausible_ptr(entries) || count <= 0 || count > 32) {
-        log_stage(5, "dict empty or insane", count);
-        return 0;
-    }
-    if (last_stage != 6) {
-        LOGI("[esp v24] OK gpc=%p dictview=%p dict=%p count=%d entries=%p",
-             gpc, dictview, dict, count, entries);
-        last_stage = 6;
-    }
-
-    // Walk up to count+free slots, scan generously since dictionary may be
-    // sparse after a player disconnect.
-    int scanned_live = 0;
-    for (int i = 0; i < count + 8 && scanned_live < count; ++i) {
-        if (i >= 32) break;
-        char *e = (char *)entries + ENTRIES_BASE + i * ENTRY_STRIDE;
-        int hashCode = *(int *)(e + 0);
-        int next     = *(int *)(e + 4);
-        if (hashCode < 0 && next < 0) continue;  // free slot
-        uint32_t key = *(uint32_t *)(e + ENTRY_KEY);
-        void *player = *(void **)(e + ENTRY_VALUE);
-        if (emit_player(player, key, out)) scanned_live++;
     }
     return (int)out.size();
 }
