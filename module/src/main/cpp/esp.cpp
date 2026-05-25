@@ -345,10 +345,14 @@ static int scan_heroes(std::vector<EspActor> &out) {
                         int32_t *f = (int32_t *)((char *)al + 0x4B8);
                         a.fwd_x = f[0]; a.fwd_y = f[1]; a.fwd_z = f[2];
                         out.push_back(a);
+                        if (hero_emitted < 6) {
+                            LOGI("[esp v33] hero[%d] key=%u cfg=%d camp=%d pos=(%.1f,%.1f,%.1f) obj=%u",
+                                 hero_emitted, key, cfg, cmp, a.x, a.y, a.z, a.objId);
+                        }
                         hero_emitted++;
                     }
                     if (last_status != 7) {
-                        LOGI("[esp v32] AM updatableActorList count=%d heroes_emitted=%d", count, hero_emitted);
+                        LOGI("[esp v33] AM updatableActorList count=%d heroes_emitted=%d", count, hero_emitted);
                         last_status = 7;
                     }
                 } else {
