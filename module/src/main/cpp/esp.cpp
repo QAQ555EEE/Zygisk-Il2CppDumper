@@ -14,7 +14,7 @@
 // type=0 (ActorTypeDef.HERO) is the only value we emit.  Overlay filters on
 // (type==0 && camp==2) to draw enemy red dots.
 //
-// Data path (verified against dump.cs ground truth, Scripts.GameSystem):
+// Data path (verified against dump.cs ground truth, Assets.Scripts.GameLogic):
 //   GamePlayerCenter.s_instance
 //     +0x18 m_playerLinkerList = DictionaryView<UInt32, Player>
 //     +0x40 hostPlayerID       = u32 (my player id)
@@ -177,7 +177,7 @@ static int scan_heroes(std::vector<EspActor> &out) {
     };
 
     if (!cached_klass) {
-        cached_klass = find_class_anywhere("Assets.Scripts.GameSystem", "GamePlayerCenter");
+        cached_klass = find_class_anywhere("Assets.Scripts.GameLogic", "GamePlayerCenter");
         if (!cached_klass) { log_stage(0, "GamePlayerCenter klass NOT_FOUND"); return 0; }
         LOGI("[esp v24] GamePlayerCenter klass=%p", cached_klass);
         Il2CppClass *parent = il2cpp_class_get_parent(cached_klass);
