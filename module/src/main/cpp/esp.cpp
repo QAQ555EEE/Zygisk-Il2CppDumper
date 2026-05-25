@@ -125,6 +125,66 @@ static Il2CppClass *find_class_anywhere(const char *ns, const char *name) {
     return nullptr;
 }
 
+// v36: SGW.GetDisplayData() / GetDisplayData_Count() global cache.
+// Refreshed once per scan tick; consumed by emit code inside the dict walk.
+const void *g_disp_buf   = nullptr;
+uint32_t    g_disp_count = 0;
+
+static void refresh_display_data() {
+    static Il2CppClass *cached_sgw = nullptr;
+    static const MethodInfo *cached_m_data = nullptr;
+    static const MethodInfo *cached_m_count = nullptr;
+    static bool init_done = false;
+    static bool init_logged_ok = false;
+
+    if (!init_done) {
+        // SGW lives in default namespace "" (dump.cs line 988228 "Namespace:")
+        cached_sgw = find_class_anywhere("", "SGW");
+        if (cached_sgw) {
+            cached_m_data  = il2cpp_class_get_method_from_name(cached_sgw, "GetDisplayData", 0);
+            cached_m_count = il2cpp_class_get_method_from_name(cached_sgw, "GetDisplayData_Count", 0);
+            if (cached_m_data && cached_m_count) {
+                LOGI("[esp v36] SGW init OK: klass=%p getData=%p getCount=%p",
+                     cached_sgw, cached_m_data, cached_m_count);
+            } else {
+                LOGI("[esp v36] SGW partial init: klass=%p data_method=%p count_method=%p",
+                     cached_sgw, cached_m_data, cached_m_count);
+            }
+        }
+        init_done = true;
+    }
+    if (!cached_m_data || !cached_m_count) {
+        g_disp_buf = nullptr;
+        g_disp_count = 0;
+        return;
+    }
+
+    Il2CppException *exc = nullptr;
+    // GetDisplayData returns DisplayInfoData* (raw native pointer, boxed as IntPtr).
+    Il2CppObject *boxed_ptr = il2cpp_runtime_invoke(cached_m_data, nullptr, nullptr, &exc);
+    if (exc || !boxed_ptr) { g_disp_buf = nullptr; g_disp_count = 0; return; }
+    // The IntPtr value lives right after the Il2CppObject header (klass+monitor = 0x10).
+    void *raw = *(void **)((char *)boxed_ptr + 0x10);
+    g_disp_buf = raw;
+
+    exc = nullptr;
+    Il2CppObject *boxed_cnt = il2cpp_runtime_invoke(cached_m_count, nullptr, nullptr, &exc);
+    if (exc || !boxed_cnt) { g_disp_count = 0; return; }
+    g_disp_count = *(uint32_t *)((char *)boxed_cnt + 0x10);
+
+    if (!init_logged_ok && g_disp_buf && g_disp_count) {
+        LOGI("[esp v36] SGW first frame: buf=%p count=%u", g_disp_buf, g_disp_count);
+        // Hex dump first entry to verify layout (DisplayInfoData)
+        const uint64_t *q = (const uint64_t *)g_disp_buf;
+        LOGI("[esp v36] disp[0] hex: %016llx %016llx %016llx %016llx %016llx %016llx %016llx %016llx",
+             (unsigned long long)q[0], (unsigned long long)q[1],
+             (unsigned long long)q[2], (unsigned long long)q[3],
+             (unsigned long long)q[4], (unsigned long long)q[5],
+             (unsigned long long)q[6], (unsigned long long)q[7]);
+        init_logged_ok = true;
+    }
+}
+
 // Walk one Player into ActorLinker, emit one EspActor if everything resolves.
 static bool emit_player(void *player, uint32_t key, std::vector<EspActor> &out) {
     if (!is_plausible_ptr(player)) return false;
@@ -347,24 +407,46 @@ static int scan_heroes(std::vector<EspActor> &out) {
                         a.camp     = cmp;
                         a.objId    = *(uint32_t *)((char *)al + 0x4AC);
 
-                        // v35: try MoveComponent.remotePosition (server-side raw,
-                        // no FOW filter) instead of ActorLinker.position (client
-                        // render, frozen at last-visible while FOW'd).
-                        //   ActorLinker +0x420 = MoveControl (MoveComponent*)
-                        //   MoveComponent +0x28 = curPosition  (client interpolated)
-                        //   MoveComponent +0x34 = remotePosition (server raw)
-                        // Fall back to ActorLinker.position@+0x4C4 if MC NULL.
-                        float *p = nullptr;
-                        void *mc = *(void **)((char *)al + 0x420);
-                        if (is_plausible_ptr(mc)) {
-                            p = (float *)((char *)mc + 0x34);
-                            // Sanity: remotePosition should look like a sgame map coord (~-65..+65)
-                            if (!(p[0] > -200.0f && p[0] < 200.0f && p[2] > -200.0f && p[2] < 200.0f)) {
-                                p = nullptr;
+                        // v35 (deprecated): MoveComponent.remotePosition also
+                        // turned out to be FOW-frozen.  v36 routes around the
+                        // FOW filter entirely by querying SGW.GetDisplayData(),
+                        // a static native bridge method that returns the raw
+                        // server-sent actor position cache (used by sgame's own
+                        // replay system, so guaranteed to include all actors
+                        // regardless of visibility).
+                        //
+                        // The lookup happens once per frame in the scanner-
+                        // thread loop below, then we resolve each actor's
+                        // entry by actorID == ActorLinker.ObjID@+0x4AC.
+                        float *p = (float *)((char *)al + 0x4C4);  // fallback
+                        if (g_disp_buf && g_disp_count) {
+                            uint32_t want = a.objId;
+                            // DisplayInfoData native layout (Pack=4, C struct):
+                            //   +0x00 actorID (u32)
+                            //   +0x04 forward (3 * i32 = 12)
+                            //   +0x10 position (3 * f32 = 12)
+                            //   +0x1c groundY (i32)
+                            //   +0x20 rotation (4 * f32 = 16)
+                            //   +0x30 parentObjID (u32)
+                            // total = 0x38? but C struct alignment may pad to 0x40
+                            const size_t STRIDES[] = { 0x38, 0x40, 0x30, 0x48 };
+                            for (size_t s = 0; s < sizeof(STRIDES)/sizeof(STRIDES[0]); ++s) {
+                                size_t stride = STRIDES[s];
+                                bool found = false;
+                                for (uint32_t i = 0; i < g_disp_count && i < 256; ++i) {
+                                    const char *e = (const char *)g_disp_buf + i * stride;
+                                    uint32_t aid = *(const uint32_t *)e;
+                                    if (aid == want) {
+                                        // Try +0x10 (managed-style layout) and +0x18 (declared offset)
+                                        float *cand = (float *)(e + 0x10);
+                                        if (cand[0] > -200.0f && cand[0] < 200.0f) {
+                                            p = cand; found = true;
+                                        }
+                                        break;
+                                    }
+                                }
+                                if (found) break;
                             }
-                        }
-                        if (!p) {
-                            p = (float *)((char *)al + 0x4C4);  // fallback to render-layer
                         }
                         a.x = p[0]; a.y = p[1]; a.z = p[2];
                         // v33 RE-mode: overlay doesn't draw forward, so reuse fwd_x/y/z to
@@ -473,6 +555,7 @@ static void scan_thread() {
         int fd = g_client_fd.load();
         if (fd < 0) continue;
 
+        refresh_display_data();  // v36: pull native cache before per-actor walk
         std::vector<EspActor> actors;
         int n = scan_heroes(actors);
 
