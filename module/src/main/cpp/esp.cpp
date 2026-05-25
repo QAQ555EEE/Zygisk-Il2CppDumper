@@ -212,34 +212,58 @@ static int scan_heroes(std::vector<EspActor> &out) {
 
     // === v26 dict hexdump: log first 0x40 bytes once per state-change to find
     // the right count/entries offsets if mscorlib layout differs in this build.
-    int   count   = *(int   *)((char *)dict + DICT_COUNT);
-    void *entries = *(void **)((char *)dict + DICT_ENTRIES);
-    if (!is_plausible_ptr(entries) || count <= 0 || count > 32) {
-        if (last_stage != 5) {
-            const uint64_t *q = (const uint64_t *)dict;
-            LOGI("[esp v26] dict@%p hex: %016llx %016llx %016llx %016llx %016llx %016llx %016llx %016llx",
-                 dict,
-                 (unsigned long long)q[0], (unsigned long long)q[1],
-                 (unsigned long long)q[2], (unsigned long long)q[3],
-                 (unsigned long long)q[4], (unsigned long long)q[5],
-                 (unsigned long long)q[6], (unsigned long long)q[7]);
-            LOGI("[esp v26] count@+0x18=%d entries@+0x10=%p (parsed values)", count, entries);
+    // === v27 layout probe: read count + entries at BOTH layout hypotheses,
+    // dump dict + entries-array hex periodically, log GPC alt-field state.
+    // mscorlib standard says _count@+0x20 (after _buckets@+0x10, _entries@+0x18).
+    int   count_h1 = *(int   *)((char *)dict + 0x18);  // legacy v6-memory layout
+    int   count_h2 = *(int   *)((char *)dict + 0x20);  // dump.cs standard mscorlib layout
+    void *entries_h1 = *(void **)((char *)dict + 0x10);
+    void *entries_h2 = *(void **)((char *)dict + 0x18);
+    void *entries_h3 = *(void **)((char *)dict + 0x20);
 
-            // Probe GamePlayerCenter alt fields for fallback container candidates.
-            void *playersTempList = *(void **)((char *)gpc + 0x30);
-            void *hostPlayer      = *(void **)((char *)gpc + 0x48);
-            void *playersCache    = *(void **)((char *)gpc + 0x50);
-            uint32_t hostPlayerID = *(uint32_t *)((char *)gpc + 0x40);
-            LOGI("[esp v26] gpc[+0x30]=%p tempList; [+0x40]=%u hostPlayerID; [+0x48]=%p hostPlayer; [+0x50]=%p cacheList",
-                 playersTempList, hostPlayerID, hostPlayer, playersCache);
-            if (is_plausible_ptr(hostPlayer)) {
-                int32_t hp_camp = *(int32_t *)((char *)hostPlayer + 0x8);
-                uint32_t hp_cfg  = *(uint32_t *)((char *)hostPlayer + 0x180);
-                void *hp_captain = *(void **)((char *)hostPlayer + 0x198 + 8);
-                LOGI("[esp v26] hostPlayer camp@+0x8=%d cfg@+0x180=%u captainAC@+0x1A0=%p",
-                     hp_camp, hp_cfg, hp_captain);
-            }
+    static int periodic_counter = 0;
+    bool do_dump = (last_stage != 5) || (++periodic_counter % 60 == 0);
+    if (do_dump) {
+        const uint64_t *q = (const uint64_t *)dict;
+        LOGI("[esp v27] dict@%p hex: %016llx %016llx %016llx %016llx %016llx %016llx %016llx %016llx",
+             dict,
+             (unsigned long long)q[0], (unsigned long long)q[1],
+             (unsigned long long)q[2], (unsigned long long)q[3],
+             (unsigned long long)q[4], (unsigned long long)q[5],
+             (unsigned long long)q[6], (unsigned long long)q[7]);
+        LOGI("[esp v27] count h1@+0x18=%d h2@+0x20=%d ; entries h1@+0x10=%p h2@+0x18=%p h3@+0x20=%p",
+             count_h1, count_h2, entries_h1, entries_h2, entries_h3);
+
+        // Try entries-h3 (+0x20 hypothesis from dump.cs). If it's a managed array, dump 64 bytes.
+        if (is_plausible_ptr(entries_h3)) {
+            const uint64_t *e = (const uint64_t *)entries_h3;
+            LOGI("[esp v27] entries_h3@%p hex: %016llx %016llx %016llx %016llx %016llx %016llx %016llx %016llx",
+                 entries_h3, (unsigned long long)e[0], (unsigned long long)e[1],
+                 (unsigned long long)e[2], (unsigned long long)e[3],
+                 (unsigned long long)e[4], (unsigned long long)e[5],
+                 (unsigned long long)e[6], (unsigned long long)e[7]);
         }
+
+        // Re-probe GPC alt fields (state may have changed since match start).
+        void *playersTempList = *(void **)((char *)gpc + 0x30);
+        void *hostPlayer      = *(void **)((char *)gpc + 0x48);
+        void *playersCache    = *(void **)((char *)gpc + 0x50);
+        uint32_t hostPlayerID = *(uint32_t *)((char *)gpc + 0x40);
+        LOGI("[esp v27] gpc[+0x30]=%p tempList; [+0x40]=%u hostPID; [+0x48]=%p hostPlayer; [+0x50]=%p cacheList",
+             playersTempList, hostPlayerID, hostPlayer, playersCache);
+        if (is_plausible_ptr(hostPlayer)) {
+            int32_t hp_camp = *(int32_t *)((char *)hostPlayer + 0x8);
+            uint32_t hp_cfg  = *(uint32_t *)((char *)hostPlayer + 0x180);
+            void *hp_captain = *(void **)((char *)hostPlayer + 0x198 + 8);
+            LOGI("[esp v27] hostPlayer camp@+0x8=%d cfg@+0x180=%u captainAC=%p",
+                 hp_camp, hp_cfg, hp_captain);
+        }
+    }
+
+    // Use h2 (dump.cs ground truth) as primary count.
+    int count = count_h2;
+    void *entries = entries_h2;  // _entries @ +0x18 per dump.cs field order
+    if (!is_plausible_ptr(entries) || count <= 0 || count > 32) {
         log_stage(5, "dict empty or insane", count);
         return 0;
     }
