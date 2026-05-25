@@ -282,43 +282,79 @@ static int scan_heroes(std::vector<EspActor> &out) {
     emit_player_logicpos(hostPlayer, 0);
     if (!cached_player_klass) cached_player_klass = il2cpp_object_get_class((Il2CppObject *)hostPlayer);
 
-    // Try to iterate playersCache (+0x50) for the rest of the players.
-    void *lv = *(void **)((char *)gpc + 0x50);
-    if (is_plausible_ptr(lv)) {
-        if (cached_lv_ctx_off < 0) {
-            Il2CppClass *lv_klass = il2cpp_object_get_class((Il2CppObject *)lv);
-            if (lv_klass) {
-                Il2CppClass *parent = il2cpp_class_get_parent(lv_klass);
-                FieldInfo *fctx = parent ? il2cpp_class_get_field_from_name(parent, "Context") : nullptr;
-                if (!fctx) fctx = il2cpp_class_get_field_from_name(lv_klass, "Context");
-                int raw = fctx ? il2cpp_field_get_offset(fctx) : -1;
-                if (raw >= 0) {
-                    cached_lv_ctx_off = raw >= 0x10 ? raw : (raw + 0x10);
-                    LOGI("[esp v31] ListView.Context @ +0x%x (raw=0x%x)", cached_lv_ctx_off, raw);
-                }
-            }
+    // === v32 ActorManager.updatableActorList scan ===
+    // playersCache confirmed empty in this sgame build.
+    // ActorManager.updatableActorList @ +0x10 is a DictionaryView<UInt32, ActorConfig>
+    // (Assets.Scripts.GameLogic) -- memory v6 tested its mscorlib Dictionary layout
+    // as count@+0x18, _entries@+0x10, entries[]: hash(0)+next(4)+key(8)+pad+value(16) stride 24.
+    // For each ActorConfig: ActorType@+0x18 (0=HERO), inner@+0x50 -> ActorConfigInner.actorLinker@+0x8 -> ActorLinker.
+    // Read ActorLinker.position@+0x4C4 Vector3 directly (proven realtime in earlier work).
+    static Il2CppClass *cached_am_klass = nullptr;
+    static FieldInfo   *cached_am_sinst = nullptr;
+    static int          cached_am_dv_ctx = -1;
+    if (!cached_am_klass) {
+        cached_am_klass = find_class_anywhere("Assets.Scripts.GameLogic", "ActorManager");
+        if (cached_am_klass) {
+            Il2CppClass *parent = il2cpp_class_get_parent(cached_am_klass);
+            cached_am_sinst = il2cpp_class_get_field_from_name(parent, "s_instance");
+            if (!cached_am_sinst) cached_am_sinst = il2cpp_class_get_field_from_name(cached_am_klass, "s_instance");
         }
-        if (cached_lv_ctx_off > 0) {
-            void *list = *(void **)((char *)lv + cached_lv_ctx_off);
-            if (is_plausible_ptr(list)) {
-                void *items = *(void **)((char *)list + 0x10);
-                int   size  = *(int   *)((char *)list + 0x18);
-                if (is_plausible_ptr(items) && size > 0 && size <= 16) {
-                    int emitted_extra = 0;
-                    for (int i = 0; i < size; ++i) {
-                        void *p = *(void **)((char *)items + 0x18 + i * sizeof(void *));
-                        if (!is_plausible_ptr(p)) continue;
-                        if (p == hostPlayer) continue;
-                        // class check: reject if not the same klass as Player.
-                        if (cached_player_klass) {
-                            Il2CppClass *ek = il2cpp_object_get_class((Il2CppObject *)p);
-                            if (ek != cached_player_klass) continue;
-                        }
-                        if (emit_player_logicpos(p, (uint32_t)(i + 1))) emitted_extra++;
+    }
+    void *am = nullptr;
+    if (cached_am_sinst) il2cpp_field_static_get_value(cached_am_sinst, &am);
+    if (is_plausible_ptr(am)) {
+        void *dv = *(void **)((char *)am + 0x10);  // updatableActorList
+        if (is_plausible_ptr(dv)) {
+            if (cached_am_dv_ctx < 0) {
+                Il2CppClass *dv_klass = il2cpp_object_get_class((Il2CppObject *)dv);
+                FieldInfo *fctx = dv_klass ? il2cpp_class_get_field_from_name(dv_klass, "Context") : nullptr;
+                int raw = fctx ? il2cpp_field_get_offset(fctx) : 0x8;
+                cached_am_dv_ctx = raw >= 0x10 ? raw : (raw + 0x10);
+                LOGI("[esp v32] AM dictview.Context @ +0x%x", cached_am_dv_ctx);
+            }
+            void *dict = *(void **)((char *)dv + cached_am_dv_ctx);
+            if (is_plausible_ptr(dict)) {
+                int   count = *(int *)((char *)dict + 0x18);
+                void *ents  = *(void **)((char *)dict + 0x10);
+                if (is_plausible_ptr(ents) && count > 0 && count < 256) {
+                    int hero_emitted = 0;
+                    for (int i = 0; i < count + 8 && i < 256; ++i) {
+                        char *e = (char *)ents + 0x18 + i * 24;
+                        int hash = *(int *)(e + 0);
+                        int next = *(int *)(e + 4);
+                        if (hash < 0 && next < 0) continue;
+                        uint32_t key = *(uint32_t *)(e + 8);
+                        void *ac     = *(void **)(e + 16);
+                        if (!is_plausible_ptr(ac)) continue;
+                        int32_t  atype = *(int32_t  *)((char *)ac + 0x18);
+                        int32_t  cmp   = *(int32_t  *)((char *)ac + 0x20);
+                        int32_t  cfg   = *(int32_t  *)((char *)ac + 0x1c);
+                        if (atype != 0) continue;   // ActorTypeDef.HERO
+                        void *inner = *(void **)((char *)ac + 0x50);
+                        if (!is_plausible_ptr(inner)) continue;
+                        void *al    = *(void **)((char *)inner + 0x08);
+                        if (!is_plausible_ptr(al)) continue;
+                        EspActor a{};
+                        a.key  = key;
+                        a.type = 0;
+                        a.configId = cfg;
+                        a.camp     = cmp;
+                        a.objId    = *(uint32_t *)((char *)al + 0x4AC);
+                        float *p = (float *)((char *)al + 0x4C4);
+                        a.x = p[0]; a.y = p[1]; a.z = p[2];
+                        int32_t *f = (int32_t *)((char *)al + 0x4B8);
+                        a.fwd_x = f[0]; a.fwd_y = f[1]; a.fwd_z = f[2];
+                        out.push_back(a);
+                        hero_emitted++;
                     }
                     if (last_status != 7) {
-                        LOGI("[esp v31] playersCache size=%d extra_emitted=%d", size, emitted_extra);
+                        LOGI("[esp v32] AM updatableActorList count=%d heroes_emitted=%d", count, hero_emitted);
                         last_status = 7;
+                    }
+                } else {
+                    if (last_status != 8) {
+                        LOGI("[esp v32] AM dict count=%d ents=%p", count, ents);
+                        last_status = 8;
                     }
                 }
             }
