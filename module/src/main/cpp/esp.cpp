@@ -235,6 +235,15 @@ static int scan_actors(std::vector<EspActor> &out) {
         return (int)out.size();
     }
 
+    // Discover Player class field offsets via IL2CPP API once.
+    // dump.cs may report relative-to-field-area offsets (we add +0x10 if < 0x10).
+    static Il2CppClass *cached_player_klass = nullptr;
+    static int off_p_camp = -1;
+    static int off_p_pos = -1;
+    static int off_p_cfg = -1;
+    static int off_p_captain = -1;
+    static const char *cached_player_class_name = nullptr;
+
     for (int i = 0; i < p_count + 4 && i < 32; ++i) {
         char *pe = (char *)p_entries + 0x18 + i * 24;
         int p_hash = *(int *)(pe + 0);
@@ -244,12 +253,44 @@ static int scan_actors(std::vector<EspActor> &out) {
         if (p_hash < 0 && p_next < 0) continue;
         if (!is_plausible_ptr(player)) continue;
 
-        int p_camp = *(int *)((char *)player + 0x8);   // playerCamp
-        int p_pos  = *(int *)((char *)player + 0xc);   // campPos
-        uint32_t p_cfg = *(uint32_t *)((char *)player + 0x180);  // captainConfigID
+        // One-shot diagnostic: dump class name + offsets + first 0x60 bytes of player[0]
+        if (!cached_player_klass) {
+            cached_player_klass = il2cpp_object_get_class((Il2CppObject *)player);
+            if (cached_player_klass) {
+                cached_player_class_name = il2cpp_class_get_name(cached_player_klass);
+                LOGI("[esp v22] player[0] class=%s", cached_player_class_name ? cached_player_class_name : "?");
+                FieldInfo *f_camp = il2cpp_class_get_field_from_name(cached_player_klass, "playerCamp");
+                FieldInfo *f_pos  = il2cpp_class_get_field_from_name(cached_player_klass, "campPos");
+                FieldInfo *f_cfg  = il2cpp_class_get_field_from_name(cached_player_klass, "captainConfigID");
+                FieldInfo *f_cap  = il2cpp_class_get_field_from_name(cached_player_klass, "Captain");
+                if (f_camp) { int r = il2cpp_field_get_offset(f_camp); off_p_camp = (r >= 0x10) ? r : (r + 0x10); }
+                if (f_pos)  { int r = il2cpp_field_get_offset(f_pos);  off_p_pos  = (r >= 0x10) ? r : (r + 0x10); }
+                if (f_cfg)  { int r = il2cpp_field_get_offset(f_cfg);  off_p_cfg  = (r >= 0x10) ? r : (r + 0x10); }
+                if (f_cap)  { int r = il2cpp_field_get_offset(f_cap);  off_p_captain = (r >= 0x10) ? r : (r + 0x10); }
+                LOGI("[esp v22] Player offsets: camp=0x%x pos=0x%x cfg=0x%x captain=0x%x",
+                     off_p_camp, off_p_pos, off_p_cfg, off_p_captain);
+                // Dump first 0x60 bytes of player[0]
+                for (int r = 0; r < 6; ++r) {
+                    uint64_t a = *(uint64_t *)((char *)player + r*16);
+                    uint64_t b = *(uint64_t *)((char *)player + r*16 + 8);
+                    LOGI("[esp v22] player[0]+%02x: %016llx %016llx", r*16,
+                         (unsigned long long)a, (unsigned long long)b);
+                }
+            }
+        }
 
-        // Captain is PoolObjHandle<ActorConfig> @ Player+0x198, T* at +8
-        char *cap_handle = (char *)player + 0x198;
+        // Use API-discovered offset if available, else fall back to dump.cs guess.
+        int o_camp = (off_p_camp >= 0) ? off_p_camp : 0x8;
+        int o_pos  = (off_p_pos  >= 0) ? off_p_pos  : 0xc;
+        int o_cfg  = (off_p_cfg  >= 0) ? off_p_cfg  : 0x180;
+        int o_cap  = (off_p_captain >= 0) ? off_p_captain : 0x198;
+
+        int p_camp = *(int *)((char *)player + o_camp);
+        int p_pos  = *(int *)((char *)player + o_pos);
+        uint32_t p_cfg = *(uint32_t *)((char *)player + o_cfg);
+
+        // Captain is PoolObjHandle<ActorConfig>, T* at handle+8
+        char *cap_handle = (char *)player + o_cap;
         void *hac = *(void **)(cap_handle + POOLHANDLE_T_PTR);
         if (!is_plausible_ptr(hac)) continue;
 
